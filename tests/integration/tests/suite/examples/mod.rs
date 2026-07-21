@@ -7,10 +7,10 @@ mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
 
-mod compact;
 mod agentic_loop;
 mod agentic_routing;
 mod anthropic_messages;
+mod compact;
 mod credential_injection;
 mod full_flow;
 mod guardrails;
