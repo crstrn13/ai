@@ -31,6 +31,10 @@ mod config;
 )]
 mod tests;
 
+use std::borrow::Cow;
+
+use base64::Engine as _;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -235,12 +239,13 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
+        let backend_messages = messages_for_backend(&self.state.messages);
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
             match name.as_str() {
                 "input" => {
-                    map.serialize_entry(name, &self.state.messages)?;
+                    map.serialize_entry(name, backend_messages.as_ref())?;
                     wrote_input = true;
                 },
                 "previous_response_id" | "conversation" => {},
@@ -251,7 +256,7 @@ impl serde::Serialize for OutboundBody<'_> {
             }
         }
         if !wrote_input {
-            map.serialize_entry("input", &self.state.messages)?;
+            map.serialize_entry("input", backend_messages.as_ref())?;
         }
         map.end()
     }
@@ -260,6 +265,41 @@ impl serde::Serialize for OutboundBody<'_> {
 /// Serialize the outbound body without cloning request state.
 fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&OutboundBody { state })
+}
+
+/// Translate compaction items to backend-compatible messages.
+///
+/// Returns `Cow::Borrowed` when no compaction items are present, avoiding
+/// allocation. When compaction items exist, returns `Cow::Owned` with each
+/// `{"type": "compaction", "summary": "..."}` translated to an assistant
+/// message — backends do not understand our internal compaction format.
+fn messages_for_backend(messages: &[serde_json::Value]) -> Cow<'_, [serde_json::Value]> {
+    let has_compaction = messages
+        .iter()
+        .any(|m| m.get("type").and_then(serde_json::Value::as_str) == Some("compaction"));
+    if !has_compaction {
+        return Cow::Borrowed(messages);
+    }
+    let translated = messages
+        .iter()
+        .map(|m| {
+            if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                let summary = m
+                    .get("encrypted_content")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": format!("[Previous conversation summary]\n\n{summary}")
+                })
+            } else {
+                m.clone()
+            }
+        })
+        .collect();
+    Cow::Owned(translated)
 }
 
 /// Count the exact bytes the proxy will serialize for an outbound body.

@@ -121,9 +121,13 @@ fn extract_compaction_config_defaults_threshold_to_zero() {
 
 #[test]
 fn compaction_item_has_correct_shape() {
-    let item = build_compaction_item("This is a summary.");
-    assert_eq!(item["role"], "system");
-    assert_eq!(item["content"], "This is a summary.");
+    use base64::Engine as _;
+    let item = build_compaction_item("compact_abc123", "This is a summary.");
+    assert_eq!(item["type"], "compaction");
+    assert_eq!(item["id"], "compact_abc123");
+    let encoded = item["encrypted_content"].as_str().unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    assert_eq!(String::from_utf8(decoded).unwrap(), "This is a summary.");
 }
 
 // =============================================================================
@@ -306,14 +310,15 @@ fn replace_messages_preserves_current_input() {
         .persisted_messages
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
-    let compaction_item = build_compaction_item("Summary of old conversation.");
+    let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.");
     replace_messages(&mut state, compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
-    assert_eq!(state.messages[0]["role"], "system");
-    assert_eq!(state.messages[0]["content"], "Summary of old conversation.");
+    assert_eq!(state.messages[0]["type"], "compaction");
+    assert_eq!(state.messages[0]["id"], "compact_test");
+    assert!(state.messages[0].get("encrypted_content").is_some());
     assert_eq!(state.persisted_messages.len(), 2);
-    assert_eq!(state.persisted_messages[0]["role"], "system");
+    assert_eq!(state.persisted_messages[0]["type"], "compaction");
 }
 
 // =============================================================================
@@ -340,4 +345,42 @@ fn token_count_supports_o200k() {
     let count = get_token_count(&text, "o200k_base");
     assert!(count.is_some());
     assert!(count.unwrap() > 0);
+}
+
+// =============================================================================
+// build_conversation_text with compaction items
+// =============================================================================
+
+#[test]
+fn conversation_text_includes_compaction_summary() {
+    let item = build_compaction_item("compact_1", "Prior context about widgets.");
+    let messages = vec![item, json!({"role": "user", "content": "Tell me more"})];
+    let text = build_conversation_text(&messages);
+    assert!(text.contains("[previous context summary]: Prior context about widgets."));
+    assert!(text.contains("user: Tell me more"));
+}
+
+#[test]
+fn conversation_text_skips_empty_compaction_summary() {
+    let item = build_compaction_item("compact_2", "");
+    let messages = vec![item, json!({"role": "user", "content": "Hello"})];
+    let text = build_conversation_text(&messages);
+    assert!(!text.contains("context summary"));
+    assert!(text.contains("user: Hello"));
+}
+
+// =============================================================================
+// canonical round-trip
+// =============================================================================
+
+#[test]
+fn compaction_item_round_trips_through_canonical_replay() {
+    use crate::openai::responses::canonical_openresponses_replay_item;
+    let item = build_compaction_item("compact_rt", "Summary text.");
+    let replayed = canonical_openresponses_replay_item(&item);
+    assert!(replayed.is_some(), "compaction item should be replayable");
+    let replayed = replayed.unwrap();
+    assert_eq!(replayed["type"], "compaction");
+    assert_eq!(replayed["id"], "compact_rt");
+    assert!(replayed.get("encrypted_content").is_some());
 }

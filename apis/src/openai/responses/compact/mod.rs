@@ -27,6 +27,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use base64::Engine as _;
 use praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
@@ -202,7 +203,8 @@ impl HttpFilter for CompactFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
-        replace_messages(state, build_compaction_item(&summary));
+        let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
+        replace_messages(state, build_compaction_item(&compaction_id, &summary));
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
@@ -369,11 +371,17 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
 
 /// Build the compaction output item.
 ///
-/// Returns: `{"role": "system", "content": "<summary>"}`
-fn build_compaction_item(summary: &str) -> Value {
+/// Returns: `{"type": "compaction", "id": "<id>", "encrypted_content": "<base64>"}`
+///
+/// The summary is base64-encoded into `encrypted_content` to match the
+/// OpenAI Responses API compaction item shape and make the content opaque
+/// to clients.
+fn build_compaction_item(id: &str, summary: &str) -> Value {
+    let encrypted_content = base64::engine::general_purpose::STANDARD.encode(summary);
     serde_json::json!({
-        "role": "system",
-        "content": summary
+        "type": "compaction",
+        "id": id,
+        "encrypted_content": encrypted_content
     })
 }
 
@@ -383,6 +391,7 @@ fn build_compaction_item(summary: &str) -> Value {
 /// - `state.messages` = `[compaction_item, ...state.input]`
 /// - `state.persisted_messages` = `[compaction_item, ...state.input]`
 ///
+/// The compaction item is `{"type": "compaction", "summary": "..."}`.
 /// `state.input` holds the current request's input items (unchanged
 /// by rehydrate), so the current turn's messages are preserved.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
@@ -400,19 +409,38 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
 fn build_conversation_text(messages: &[Value]) -> String {
     let mut buf = String::with_capacity(messages.len() * 100);
     for msg in messages {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
-        let content = extract_content(msg);
-        if content.is_empty() {
+        if msg.get("type").and_then(Value::as_str) == Some("compaction") {
+            if let Some(summary) = decode_compaction_summary(msg)
+                && !summary.is_empty()
+            {
+                append_line(&mut buf, "[previous context summary]", &summary);
+            }
             continue;
         }
-        if !buf.is_empty() {
-            buf.push_str("\n\n");
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
+        let content = extract_content(msg);
+        if !content.is_empty() {
+            append_line(&mut buf, role, &content);
         }
-        buf.push_str(role);
-        buf.push_str(": ");
-        buf.push_str(&content);
     }
     buf
+}
+
+/// Append `"<label>: <text>"` to `buf`, preceded by a blank line if not empty.
+fn append_line(buf: &mut String, label: &str, text: &str) {
+    if !buf.is_empty() {
+        buf.push_str("\n\n");
+    }
+    buf.push_str(label);
+    buf.push_str(": ");
+    buf.push_str(text);
+}
+
+/// Decode a compaction item's `encrypted_content` field to a UTF-8 string.
+fn decode_compaction_summary(msg: &Value) -> Option<String> {
+    let encoded = msg.get("encrypted_content").and_then(Value::as_str)?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 /// Extract text content from a message's `content` field.
