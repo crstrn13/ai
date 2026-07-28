@@ -408,6 +408,58 @@ fn conversation_text_skips_empty_compaction_summary() {
 }
 
 // =============================================================================
+// on_callout_error: open/closed failure mode
+// =============================================================================
+
+fn make_filter(failure_mode: &str) -> CompactFilter {
+    let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: {failure_mode}"
+    ))
+    .unwrap();
+    let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
+    let validated = build_config(&cfg).unwrap();
+    use praxis_core::callout::CalloutClient;
+    let callout_client = CalloutClient::new(validated.callout.build_callout_config()).unwrap();
+    CompactFilter { callout_client, config: validated }
+}
+
+#[test]
+fn callout_error_open_mode_skips_compaction() {
+    let filter = make_filter("open");
+    let result = filter.on_callout_error("something went wrong", false);
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_none(), "open mode should skip compaction");
+}
+
+#[test]
+fn callout_error_closed_mode_rejects_request() {
+    let filter = make_filter("closed");
+    let result = filter.on_callout_error("something went wrong", false);
+    assert!(result.is_err(), "closed mode should reject the request");
+}
+
+#[test]
+fn parse_failure_open_mode_skips_compaction() {
+    let filter = make_filter("open");
+    let bad_body = b"not valid json";
+    let result = parse_summarization_response(bad_body)
+        .map(Some)
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_none());
+}
+
+#[test]
+fn parse_failure_closed_mode_rejects_request() {
+    let filter = make_filter("closed");
+    let bad_body = b"not valid json";
+    let result = parse_summarization_response(bad_body)
+        .map(Some)
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+    assert!(result.is_err());
+}
+
+// =============================================================================
 // canonical round-trip
 // =============================================================================
 

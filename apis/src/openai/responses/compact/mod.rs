@@ -38,6 +38,7 @@ use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
+use crate::openai::responses::config_validation::FailureMode;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -136,11 +137,11 @@ impl CompactFilter {
         match self.callout_client.execute(request).await {
             CalloutResult::Success(resp) => parse_summarization_response(&resp.body).map(Some).or_else(|e| {
                 warn!(error = %e, "failed to parse summarization response, skipping compaction");
-                Ok(None)
+                self.on_callout_error("failed to parse summarization response", streaming)
             }),
             CalloutResult::Failed => {
                 warn!("summarization callout failed, skipping compaction");
-                Ok(None)
+                self.on_callout_error("summarization callout failed", streaming)
             },
             CalloutResult::Rejected(rejection) => {
                 warn!(status = rejection.status, "summarization callout rejected");
@@ -151,6 +152,19 @@ impl CompactFilter {
                     streaming,
                 )))
             },
+        }
+    }
+
+    /// Apply the configured open/closed policy on a callout error.
+    fn on_callout_error(&self, message: &'static str, streaming: bool) -> Result<Option<String>, FilterAction> {
+        match self.config.callout.failure_mode {
+            FailureMode::Open => Ok(None),
+            FailureMode::Closed => Err(FilterAction::Reject(responses_error_rejection(
+                self.config.callout.status_on_error,
+                "server_error",
+                message,
+                streaming,
+            ))),
         }
     }
 }
