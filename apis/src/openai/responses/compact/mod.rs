@@ -404,26 +404,45 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
 
 /// Format a message array as readable text for the summarization prompt.
 ///
-/// Each message becomes: `<role>: <content>`
-/// Messages are separated by blank lines.
+/// Each message becomes `<label>: <text>`, separated by blank lines.
+/// Handles regular messages, tool calls, tool outputs, and prior compaction items.
 fn build_conversation_text(messages: &[Value]) -> String {
     let mut buf = String::with_capacity(messages.len() * 100);
     for msg in messages {
-        if msg.get("type").and_then(Value::as_str) == Some("compaction") {
+        append_item(&mut buf, msg);
+    }
+    buf
+}
+
+/// Append a single conversation item to the text buffer.
+fn append_item(buf: &mut String, msg: &Value) {
+    match msg.get("type").and_then(Value::as_str) {
+        Some("compaction") => {
             if let Some(summary) = decode_compaction_summary(msg)
                 && !summary.is_empty()
             {
-                append_line(&mut buf, "[previous context summary]", &summary);
+                append_line(buf, "[previous context summary]", &summary);
             }
-            continue;
-        }
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
-        let content = extract_content(msg);
-        if !content.is_empty() {
-            append_line(&mut buf, role, &content);
-        }
+        },
+        Some("function_call") => {
+            let name = msg.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let args = msg.get("arguments").and_then(Value::as_str).unwrap_or("");
+            append_line(buf, "function_call", &format!("{name}({args})"));
+        },
+        Some("function_call_output") => {
+            let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
+            if !output.is_empty() {
+                append_line(buf, "function_call_output", output);
+            }
+        },
+        _ => {
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
+            let content = extract_content(msg);
+            if !content.is_empty() {
+                append_line(buf, role, &content);
+            }
+        },
     }
-    buf
 }
 
 /// Append `"<label>: <text>"` to `buf`, preceded by a blank line if not empty.

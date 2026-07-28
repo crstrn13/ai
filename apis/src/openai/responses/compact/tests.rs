@@ -348,6 +348,44 @@ fn token_count_supports_o200k() {
 }
 
 // =============================================================================
+// build_conversation_text with tool items
+// =============================================================================
+
+#[test]
+fn conversation_text_includes_function_call() {
+    let messages = vec![
+        json!({"role": "user", "content": "What's the weather?"}),
+        json!({"type": "function_call", "name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}),
+    ];
+    let text = build_conversation_text(&messages);
+    assert!(text.contains("function_call: get_weather({\"city\":\"NYC\"})"));
+}
+
+#[test]
+fn conversation_text_includes_function_call_output() {
+    let messages = vec![
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"temp\":72}"}),
+    ];
+    let text = build_conversation_text(&messages);
+    assert!(text.contains("function_call_output: {\"temp\":72}"));
+}
+
+#[test]
+fn conversation_text_full_tool_round_trip() {
+    let messages = vec![
+        json!({"role": "user", "content": "What's the weather in NYC?"}),
+        json!({"type": "function_call", "name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"temp\":72}"}),
+        json!({"role": "assistant", "content": "It's 72°F in NYC."}),
+    ];
+    let text = build_conversation_text(&messages);
+    assert!(text.contains("user: What's the weather in NYC?"));
+    assert!(text.contains("function_call: get_weather("));
+    assert!(text.contains("function_call_output: {\"temp\":72}"));
+    assert!(text.contains("assistant: It's 72°F in NYC."));
+}
+
+// =============================================================================
 // build_conversation_text with compaction items
 // =============================================================================
 
