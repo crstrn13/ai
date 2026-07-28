@@ -54,6 +54,21 @@ fn build_config_rejects_invalid_status() {
 }
 
 #[test]
+fn build_config_rejects_unsupported_tiktoken_encoding() {
+    let mut cfg = base_config();
+    cfg.tiktoken_encoding = "gpt4".to_owned();
+    let err = build_config(&cfg).unwrap_err();
+    assert!(err.to_string().contains("unsupported tiktoken_encoding"));
+}
+
+#[test]
+fn build_config_accepts_o200k_base_encoding() {
+    let mut cfg = base_config();
+    cfg.tiktoken_encoding = "o200k_base".to_owned();
+    assert!(build_config(&cfg).is_ok());
+}
+
+#[test]
 fn build_config_custom_values() {
     let mut cfg = base_config();
     cfg.timeout_ms = Some(60_000);

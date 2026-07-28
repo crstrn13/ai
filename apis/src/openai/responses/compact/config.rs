@@ -64,6 +64,7 @@ fn default_tiktoken_encoding() -> String {
 // -----------------------------------------------------------------------------
 
 /// Validated configuration with defaults applied.
+#[derive(Debug)]
 pub(super) struct ValidatedConfig {
     /// URL of the inference backend for summarization calls.
     pub inference_url: String,
@@ -78,15 +79,27 @@ pub(super) struct ValidatedConfig {
     pub callout: CalloutSettings,
 }
 
+/// Supported tiktoken encoding names.
+const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
+
 /// Validate raw config and apply defaults.
 ///
 /// # Errors
 ///
 /// Returns [`FilterError`] if `inference_url` is empty,
+/// `tiktoken_encoding` is not a supported encoding name,
 /// `timeout_ms` is zero, or `status_on_error` is out of range.
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
     if raw.inference_url.is_empty() {
         return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
+    }
+
+    if !SUPPORTED_ENCODINGS.contains(&raw.tiktoken_encoding.as_str()) {
+        return Err(FilterError::from(format!(
+            "openai_responses_compact: unsupported tiktoken_encoding {:?}; supported: {}",
+            raw.tiktoken_encoding,
+            SUPPORTED_ENCODINGS.join(", ")
+        )));
     }
 
     let timeout_ms =

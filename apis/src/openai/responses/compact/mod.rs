@@ -8,7 +8,7 @@
 //! this filter summarizes the conversation history via a sub-request
 //! to an inference backend, replacing it with a single compaction
 //! item. Runs after `rehydrate` (which populates messages and
-//! previous usage) and before `openai_tool_parse`.
+//! previous usage) and after `openai_tool_parse`.
 //!
 //! # Scope
 //!
