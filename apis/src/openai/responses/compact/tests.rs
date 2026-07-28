@@ -16,7 +16,7 @@ fn base_config() -> CompactFilterConfig {
         default_model: "gpt-4o-mini".to_owned(),
         tiktoken_encoding: "cl100k_base".to_owned(),
         timeout_ms: None,
-        failure_mode: None,
+        callout_failure_mode: None,
         status_on_error: None,
     }
 }
@@ -57,7 +57,7 @@ fn build_config_rejects_invalid_status() {
 fn build_config_custom_values() {
     let mut cfg = base_config();
     cfg.timeout_ms = Some(60_000);
-    cfg.failure_mode = Some(FailureMode::Open);
+    cfg.callout_failure_mode = Some(FailureMode::Open);
     cfg.status_on_error = Some(503);
     let validated = build_config(&cfg).unwrap();
     assert_eq!(validated.callout.timeout_ms, 60_000);

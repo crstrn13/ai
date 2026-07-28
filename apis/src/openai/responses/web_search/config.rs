@@ -121,7 +121,7 @@ pub(super) struct WebSearchFilterConfig {
 
     /// Failure mode for search callouts.
     #[serde(default)]
-    pub failure_mode: Option<FailureMode>,
+    pub callout_failure_mode: Option<FailureMode>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
@@ -191,7 +191,7 @@ pub(super) fn build_config(raw: &WebSearchFilterConfig) -> Result<ValidatedConfi
         max_body_bytes: validate_max_body_bytes_field(raw.max_body_bytes)?,
         callout: CalloutSettings {
             timeout_ms,
-            failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
+            failure_mode: raw.callout_failure_mode.unwrap_or(FailureMode::Closed),
             status_on_error,
         },
     })
@@ -258,7 +258,7 @@ mod tests {
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            failure_mode: None,
+            callout_failure_mode: None,
             status_on_error: None,
         }
     }
@@ -318,7 +318,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.failure_mode = Some(FailureMode::Open);
+        cfg.callout_failure_mode = Some(FailureMode::Open);
         cfg.status_on_error = Some(503);
         let validated = build_config(&cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);

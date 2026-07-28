@@ -42,7 +42,7 @@ pub(super) struct CompactFilterConfig {
 
     /// Failure mode for the inference callout.
     #[serde(default)]
-    pub failure_mode: Option<FailureMode>,
+    pub callout_failure_mode: Option<FailureMode>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
@@ -104,8 +104,39 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
         callout: CalloutSettings {
             timeout_ms,
-            failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
+            failure_mode: raw.callout_failure_mode.unwrap_or(FailureMode::Closed),
             status_on_error,
         },
     })
+}
+
+#[cfg(test)]
+mod yaml_tests {
+    use super::*;
+
+    #[test]
+    fn callout_failure_mode_open_deserializes_from_yaml() {
+        let cfg: CompactFilterConfig = serde_yaml::from_str(
+            "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: open",
+        )
+        .expect("should deserialize");
+        assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Open));
+    }
+
+    #[test]
+    fn callout_failure_mode_closed_deserializes_from_yaml() {
+        let cfg: CompactFilterConfig = serde_yaml::from_str(
+            "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: closed",
+        )
+        .expect("should deserialize");
+        assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Closed));
+    }
+
+    #[test]
+    fn callout_failure_mode_absent_defaults_to_none() {
+        let cfg: CompactFilterConfig =
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions")
+                .expect("should deserialize");
+        assert_eq!(cfg.callout_failure_mode, None);
+    }
 }
