@@ -274,32 +274,35 @@ fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json
 /// `{"type": "compaction", "summary": "..."}` translated to an assistant
 /// message — backends do not understand our internal compaction format.
 fn messages_for_backend(messages: &[serde_json::Value]) -> Cow<'_, [serde_json::Value]> {
-    let has_compaction = messages
-        .iter()
-        .any(|m| m.get("type").and_then(serde_json::Value::as_str) == Some("compaction"));
-    if !has_compaction {
-        return Cow::Borrowed(messages);
+    let mut translated: Option<Vec<serde_json::Value>> = None;
+
+    for (i, m) in messages.iter().enumerate() {
+        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+            let vec = translated.get_or_insert_with(|| messages.get(..i).unwrap_or(&[]).to_vec());
+            vec.push(compaction_to_assistant_message(m));
+        } else if let Some(vec) = &mut translated {
+            vec.push(m.clone());
+        }
     }
-    let translated = messages
-        .iter()
-        .map(|m| {
-            if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
-                let summary = m
-                    .get("encrypted_content")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": format!("[Previous conversation summary]\n\n{summary}")
-                })
-            } else {
-                m.clone()
-            }
-        })
-        .collect();
-    Cow::Owned(translated)
+
+    match translated {
+        Some(vec) => Cow::Owned(vec),
+        None => Cow::Borrowed(messages),
+    }
+}
+
+/// Translate a compaction item to a Chat Completions assistant message.
+fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
+    let summary = m
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    serde_json::json!({
+        "role": "assistant",
+        "content": format!("[Previous conversation summary]\n\n{summary}")
+    })
 }
 
 /// Count the exact bytes the proxy will serialize for an outbound body.

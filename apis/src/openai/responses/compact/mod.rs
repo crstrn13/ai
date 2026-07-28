@@ -446,17 +446,11 @@ fn build_conversation_text(messages: &[Value]) -> String {
 /// Append a single conversation item to the text buffer.
 fn append_item(buf: &mut String, msg: &Value) {
     match msg.get("type").and_then(Value::as_str) {
-        Some("compaction") => {
-            if let Some(summary) = decode_compaction_summary(msg)
-                && !summary.is_empty()
-            {
-                append_line(buf, "[previous context summary]", &summary);
-            }
-        },
+        Some("compaction") => append_compaction_summary(buf, msg),
         Some("function_call") => {
             let name = msg.get("name").and_then(Value::as_str).unwrap_or("unknown");
             let args = msg.get("arguments").and_then(Value::as_str).unwrap_or("");
-            append_line(buf, "function_call", &format!("{name}({args})"));
+            append_function_call(buf, name, args);
         },
         Some("function_call_output") => {
             let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
@@ -485,11 +479,36 @@ fn append_line(buf: &mut String, label: &str, text: &str) {
 }
 
 /// Decode a compaction item's `encrypted_content` field to a UTF-8 string.
-fn decode_compaction_summary(msg: &Value) -> Option<String> {
-    let encoded = msg.get("encrypted_content").and_then(Value::as_str)?;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-    String::from_utf8(decoded).ok()
+/// Append a compaction item's summary to the buffer without a String allocation.
+///
+/// Decodes `encrypted_content` and borrows the result as `&str` directly,
+/// avoiding the `String::from_utf8` conversion that would copy the buffer.
+fn append_compaction_summary(buf: &mut String, msg: &Value) {
+    let Some(encoded) = msg.get("encrypted_content").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return;
+    };
+    if let Ok(summary) = std::str::from_utf8(&decoded)
+        && !summary.is_empty()
+    {
+        append_line(buf, "[previous context summary]", summary);
+    }
 }
+
+/// Append a function call entry without a temporary allocation.
+fn append_function_call(buf: &mut String, name: &str, args: &str) {
+    if !buf.is_empty() {
+        buf.push_str("\n\n");
+    }
+    buf.push_str("function_call: ");
+    buf.push_str(name);
+    buf.push('(');
+    buf.push_str(args);
+    buf.push(')');
+}
+
 
 /// Extract text content from a message's `content` field.
 ///
