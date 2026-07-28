@@ -279,7 +279,9 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
         if entry_type != "compaction" {
             continue;
         }
-        let compact_threshold = entry.get("compact_threshold").and_then(Value::as_u64).unwrap_or(0);
+        let Some(compact_threshold) = entry.get("compact_threshold").and_then(Value::as_u64) else {
+            continue;
+        };
         let compaction_model = entry
             .get("compaction_model")
             .and_then(Value::as_str)

@@ -109,10 +109,22 @@ fn extract_compaction_config_empty_array() {
 }
 
 #[test]
-fn extract_compaction_config_defaults_threshold_to_zero() {
+fn extract_compaction_config_missing_threshold_skips_compaction() {
     let cm = Some(json!([{"type": "compaction"}]));
+    assert!(extract_compaction_config(&cm).is_none(), "missing threshold should skip compaction");
+}
+
+#[test]
+fn extract_compaction_config_null_threshold_skips_compaction() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": null}]));
+    assert!(extract_compaction_config(&cm).is_none(), "null threshold should skip compaction");
+}
+
+#[test]
+fn extract_compaction_config_zero_threshold_compacts_immediately() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 0}]));
     let params = extract_compaction_config(&cm).unwrap();
-    assert_eq!(params.compact_threshold, 0);
+    assert_eq!(params.compact_threshold, 0, "explicit zero should still compact");
 }
 
 // =============================================================================
