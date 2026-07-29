@@ -3,7 +3,6 @@
 
 //! Shared config validation helpers for Responses API filters.
 
-use praxis_core::callout::{CalloutConfig, CircuitBreakerConfig, FailureMode as CoreFailureMode};
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -36,25 +35,6 @@ pub(crate) struct CalloutSettings {
     pub status_on_error: u16,
 }
 
-impl CalloutSettings {
-    /// Build a [`CalloutConfig`] from these settings.
-    pub(crate) fn build_callout_config(self) -> CalloutConfig {
-        let failure_mode = match self.failure_mode {
-            FailureMode::Closed => CoreFailureMode::Closed,
-            FailureMode::Open => CoreFailureMode::Open,
-        };
-        CalloutConfig {
-            circuit_breaker: Some(CircuitBreakerConfig {
-                consecutive_failures: 5,
-                recovery_window_ms: 30_000,
-            }),
-            failure_mode,
-            status_on_error: self.status_on_error,
-            timeout_ms: self.timeout_ms,
-            ..CalloutConfig::default()
-        }
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Validation helpers

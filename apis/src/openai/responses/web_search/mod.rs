@@ -67,7 +67,7 @@ use crate::openai::responses::error::responses_error_rejection;
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// callout_failure_mode: closed
+/// failure_mode: closed
 /// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```

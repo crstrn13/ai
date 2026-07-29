@@ -279,16 +279,14 @@ fn extract_content_null() {
 fn summarization_request_without_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let req = build_summarization_request(
+    let (req, _target) = build_summarization_request(
         &conversation_text,
         None,
         "gpt-4o-mini",
         "http://localhost/v1/chat/completions",
-    );
+    ).unwrap();
     assert_eq!(req.method, http::Method::POST);
-    assert_eq!(req.url, "http://localhost/v1/chat/completions");
-    assert!(req.body.is_some());
-    let body: Value = serde_json::from_slice(&req.body.unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["model"], "gpt-4o-mini");
     let msgs = body["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 2);
@@ -302,13 +300,13 @@ fn summarization_request_without_instructions() {
 fn summarization_request_with_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let req = build_summarization_request(
+    let (req, _target) = build_summarization_request(
         &conversation_text,
         Some("Be concise"),
         "gpt-4o-mini",
         "http://localhost/v1/chat/completions",
-    );
-    let body: Value = serde_json::from_slice(&req.body.unwrap()).unwrap();
+    ).unwrap();
+    let body: Value = serde_json::from_slice(&req.body).unwrap();
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("Be concise"), "instructions should be prepended");
     assert!(system.contains("Summarize"), "system prompt should follow");
@@ -439,15 +437,14 @@ fn conversation_text_skips_empty_compaction_summary() {
 // =============================================================================
 
 fn make_filter(failure_mode: &str) -> CompactFilter {
+    use crate::subrequest::SubRequestConnector;
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
         "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: {failure_mode}"
     ))
     .unwrap();
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
     let validated = build_config(&cfg).unwrap();
-    use praxis_core::callout::CalloutClient;
-    let callout_client = CalloutClient::new(validated.callout.build_callout_config()).unwrap();
-    CompactFilter { callout_client, config: validated }
+    CompactFilter { connector: SubRequestConnector::new(1, None), config: validated }
 }
 
 #[test]
