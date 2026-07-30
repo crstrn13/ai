@@ -131,27 +131,24 @@ mod yaml_tests {
 
     #[test]
     fn callout_failure_mode_open_deserializes_from_yaml() {
-        let cfg: CompactFilterConfig = serde_yaml::from_str(
-            "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: open",
-        )
-        .expect("should deserialize");
+        let cfg: CompactFilterConfig =
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: open")
+                .expect("should deserialize");
         assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Open));
     }
 
     #[test]
     fn callout_failure_mode_closed_deserializes_from_yaml() {
-        let cfg: CompactFilterConfig = serde_yaml::from_str(
-            "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: closed",
-        )
-        .expect("should deserialize");
+        let cfg: CompactFilterConfig =
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: closed")
+                .expect("should deserialize");
         assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Closed));
     }
 
     #[test]
     fn callout_failure_mode_absent_defaults_to_none() {
         let cfg: CompactFilterConfig =
-            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions")
-                .expect("should deserialize");
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions").expect("should deserialize");
         assert_eq!(cfg.callout_failure_mode, None);
     }
 }

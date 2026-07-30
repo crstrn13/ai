@@ -81,7 +81,12 @@ fn start_sequenced_backend(
     (port, captured)
 }
 
-fn handle_sequenced_request(mut stream: TcpStream, response_body: &str, call: u32, captured: &Arc<Mutex<Option<String>>>) {
+fn handle_sequenced_request(
+    mut stream: TcpStream,
+    response_body: &str,
+    call: u32,
+    captured: &Arc<Mutex<Option<String>>>,
+) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut data = Vec::new();
     let mut buf = [0_u8; 4096];
@@ -92,7 +97,8 @@ fn handle_sequenced_request(mut stream: TcpStream, response_body: &str, call: u3
         }
         let raw = String::from_utf8_lossy(&data);
         if let Some(header_end) = raw.find("\r\n\r\n") {
-            let content_length: usize = raw.get(..header_end)
+            let content_length: usize = raw
+                .get(..header_end)
                 .unwrap_or("")
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -241,16 +247,31 @@ async fn compact_verifies_summarization_call_and_compacted_state() {
 
     // The input should have exactly 2 items: the compacted summary + the current input.
     let input = inference_json["input"].as_array().expect("input should be an array");
-    assert_eq!(input.len(), 2, "compacted input should have exactly 2 items: summary + current input");
+    assert_eq!(
+        input.len(),
+        2,
+        "compacted input should have exactly 2 items: summary + current input"
+    );
 
     // The first item should be the translated compaction summary (assistant message).
-    assert_eq!(input[0]["role"], "assistant", "first item should be the compaction summary as an assistant message");
-    let content = input[0]["content"].as_str().expect("summary content should be a string");
-    assert!(content.contains("Previous conversation summary"), "summary should be labeled");
+    assert_eq!(
+        input[0]["role"], "assistant",
+        "first item should be the compaction summary as an assistant message"
+    );
+    let content = input[0]["content"]
+        .as_str()
+        .expect("summary content should be a string");
+    assert!(
+        content.contains("Previous conversation summary"),
+        "summary should be labeled"
+    );
 
     // The second item should be the current user input.
-    let second = input[1]["content"].as_str().unwrap_or_else(|| {
-        input[1]["content"][0]["text"].as_str().unwrap_or("")
-    });
-    assert!(second.contains("Compare with QUIC"), "second item should be the current user input");
+    let second = input[1]["content"]
+        .as_str()
+        .unwrap_or_else(|| input[1]["content"][0]["text"].as_str().unwrap_or(""));
+    assert!(
+        second.contains("Compare with QUIC"),
+        "second item should be the current user input"
+    );
 }

@@ -35,20 +35,21 @@ mod tests;
 use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use base64::Engine as _;
+use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
     parse_filter_config,
 };
-
-use crate::subrequest::{self, SubRequest, SubRequestConnector};
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
-use crate::openai::responses::config_validation::FailureMode;
+use crate::{
+    openai::responses::config_validation::FailureMode,
+    subrequest::{self, SubRequest, SubRequestClient},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -104,8 +105,8 @@ struct CompactionParams {
 /// status_on_error: 502
 /// ```
 pub struct CompactFilter {
-    /// HTTP connector for the summarization inference call.
-    connector: SubRequestConnector,
+    /// HTTP client for the summarization inference call.
+    client: SubRequestClient,
     /// Validated filter configuration.
     config: ValidatedConfig,
 }
@@ -120,7 +121,7 @@ impl CompactFilter {
         let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
         let validated = build_config(&cfg)?;
         Ok(Box::new(Self {
-            connector: SubRequestConnector::new(4, None),
+            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
             config: validated,
         }))
     }
@@ -139,15 +140,16 @@ impl CompactFilter {
     ) -> Result<Option<String>, FilterAction> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
-        let (request, target) = match build_summarization_request(conversation_text, instructions, model, &self.config.inference_url) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(error = %e, "failed to parse summarization inference URL");
-                return self.on_callout_error("invalid inference_url", streaming);
-            },
-        };
+        let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute(&self.connector, &target, &request, MAX_SUMMARIZATION_RESPONSE_BYTES, timeout).await;
+        let result = subrequest::execute_url(
+            &self.client,
+            &self.config.inference_url,
+            request,
+            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            timeout,
+        )
+        .await;
         self.handle_subrequest_result(result, streaming)
     }
 
@@ -165,13 +167,8 @@ impl CompactFilter {
                 })
             },
             Ok(resp) => {
-                warn!(status = resp.status, "summarization callout rejected");
-                Err(FilterAction::Reject(responses_error_rejection(
-                    resp.status,
-                    "server_error",
-                    "summarization callout rejected",
-                    streaming,
-                )))
+                warn!(status = resp.status, "summarization callout returned non-2xx");
+                self.on_callout_error("summarization callout rejected", streaming)
             },
             Err(e) => {
                 warn!(error = %e, "summarization callout failed");
@@ -181,7 +178,7 @@ impl CompactFilter {
     }
 
     /// Apply the configured open/closed policy on a callout error.
-    fn on_callout_error(&self, message: &'static str, streaming: bool) -> Result<Option<String>, FilterAction> {
+    fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
         match self.config.callout.failure_mode {
             FailureMode::Open => Ok(None),
             FailureMode::Closed => Err(FilterAction::Reject(responses_error_rejection(
@@ -360,12 +357,7 @@ fn get_token_count(conversation_text: &str, tiktoken_encoding: &str) -> Option<u
 ///   ]
 /// }
 /// ```
-fn build_summarization_request(
-    conversation_text: &str,
-    instructions: Option<&str>,
-    model: &str,
-    inference_url: &str,
-) -> Result<(SubRequest, subrequest::TargetPeer), subrequest::SubRequestError> {
+fn build_summarization_request(conversation_text: &str, instructions: Option<&str>, model: &str) -> SubRequest {
     let system_content = match instructions {
         Some(inst) => format!("{inst}\n\n{SUMMARIZATION_SYSTEM_PROMPT}"),
         None => SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
@@ -380,13 +372,20 @@ fn build_summarization_request(
     });
 
     let body_bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-    let (target, uri) = subrequest::parse_url(inference_url)?;
 
     let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
     headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-    Ok((SubRequest { method: http::Method::POST, uri, headers, body: body_bytes }, target))
+    SubRequest {
+        method: http::Method::POST,
+        uri: http::Uri::default(),
+        headers,
+        body: body_bytes,
+    }
 }
 
 /// Parse the Chat Completions response and extract the summary text.

@@ -126,13 +126,19 @@ fn extract_compaction_config_empty_array() {
 #[test]
 fn extract_compaction_config_missing_threshold_skips_compaction() {
     let cm = Some(json!([{"type": "compaction"}]));
-    assert!(extract_compaction_config(&cm).is_none(), "missing threshold should skip compaction");
+    assert!(
+        extract_compaction_config(&cm).is_none(),
+        "missing threshold should skip compaction"
+    );
 }
 
 #[test]
 fn extract_compaction_config_null_threshold_skips_compaction() {
     let cm = Some(json!([{"type": "compaction", "compact_threshold": null}]));
-    assert!(extract_compaction_config(&cm).is_none(), "null threshold should skip compaction");
+    assert!(
+        extract_compaction_config(&cm).is_none(),
+        "null threshold should skip compaction"
+    );
 }
 
 #[test]
@@ -279,12 +285,7 @@ fn extract_content_null() {
 fn summarization_request_without_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let (req, _target) = build_summarization_request(
-        &conversation_text,
-        None,
-        "gpt-4o-mini",
-        "http://localhost/v1/chat/completions",
-    ).unwrap();
+    let req = build_summarization_request(&conversation_text, None, "gpt-4o-mini");
     assert_eq!(req.method, http::Method::POST);
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["model"], "gpt-4o-mini");
@@ -300,12 +301,7 @@ fn summarization_request_without_instructions() {
 fn summarization_request_with_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let (req, _target) = build_summarization_request(
-        &conversation_text,
-        Some("Be concise"),
-        "gpt-4o-mini",
-        "http://localhost/v1/chat/completions",
-    ).unwrap();
+    let req = build_summarization_request(&conversation_text, Some("Be concise"), "gpt-4o-mini");
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("Be concise"), "instructions should be prepended");
@@ -388,9 +384,7 @@ fn conversation_text_includes_function_call() {
 
 #[test]
 fn conversation_text_includes_function_call_output() {
-    let messages = vec![
-        json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"temp\":72}"}),
-    ];
+    let messages = vec![json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"temp\":72}"})];
     let text = build_conversation_text(&messages);
     assert!(text.contains("function_call_output: {\"temp\":72}"));
 }
@@ -437,14 +431,16 @@ fn conversation_text_skips_empty_compaction_summary() {
 // =============================================================================
 
 fn make_filter(failure_mode: &str) -> CompactFilter {
-    use crate::subrequest::SubRequestConnector;
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
         "inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: {failure_mode}"
     ))
     .unwrap();
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
     let validated = build_config(&cfg).unwrap();
-    CompactFilter { connector: SubRequestConnector::new(1, None), config: validated }
+    CompactFilter {
+        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None)),
+        config: validated,
+    }
 }
 
 #[test]
@@ -481,6 +477,35 @@ fn parse_failure_closed_mode_rejects_request() {
         .map(Some)
         .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
     assert!(result.is_err());
+}
+
+// =============================================================================
+// non-2xx summarization response respects callout_failure_mode
+// =============================================================================
+
+#[test]
+fn non_2xx_response_open_mode_skips_compaction() {
+    let filter = make_filter("open");
+    let resp = subrequest::SubResponse {
+        status: 503,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from_static(b"service unavailable"),
+    };
+    let result = filter.handle_subrequest_result(Ok(resp), false);
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_none(), "open mode should skip compaction on non-2xx");
+}
+
+#[test]
+fn non_2xx_response_closed_mode_rejects_request() {
+    let filter = make_filter("closed");
+    let resp = subrequest::SubResponse {
+        status: 429,
+        headers: http::HeaderMap::new(),
+        body: Bytes::from_static(b"rate limited"),
+    };
+    let result = filter.handle_subrequest_result(Ok(resp), false);
+    assert!(result.is_err(), "closed mode should reject on non-2xx");
 }
 
 // =============================================================================

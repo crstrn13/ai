@@ -13,7 +13,7 @@ Summarizes conversation history when the token count exceeds a configured thresh
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation. Used as fallback when `previous_usage` is unavailable. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
-| `failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
+| `callout_failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
 
 ## Examples
@@ -34,6 +34,6 @@ inference_url: "http://localhost:11434/v1/chat/completions"
 default_model: gpt-4o-mini
 tiktoken_encoding: cl100k_base
 timeout_ms: 30000
-failure_mode: closed
+callout_failure_mode: closed
 status_on_error: 502
 ```

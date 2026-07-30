@@ -33,9 +33,8 @@ mod tests;
 
 use std::borrow::Cow;
 
-use base64::Engine as _;
-
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,

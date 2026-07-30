@@ -268,10 +268,12 @@ mod tests {
         let messages = mapped["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Summary of prior conversation."));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Summary of prior conversation.")
+        );
         assert_eq!(messages[1]["role"], "user");
     }
 
