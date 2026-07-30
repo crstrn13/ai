@@ -124,6 +124,8 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
 }
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
 mod yaml_tests {
     use super::*;
 

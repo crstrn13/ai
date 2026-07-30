@@ -66,14 +66,14 @@ fn start_sequenced_backend(
     let capture_slot = Arc::clone(&captured);
 
     std::thread::spawn(move || {
-        let mut call = 0u32;
+        let mut call = 0_u32;
         for stream in listener.incoming().flatten() {
             call += 1;
             let body = if call == 1 { first_response } else { second_response };
             let slot = Arc::clone(&capture_slot);
             let body = body.to_owned();
             std::thread::spawn(move || {
-                handle_sequenced_request(stream, &body, call, slot);
+                handle_sequenced_request(stream, &body, call, &slot);
             });
         }
     });
@@ -81,10 +81,10 @@ fn start_sequenced_backend(
     (port, captured)
 }
 
-fn handle_sequenced_request(mut stream: TcpStream, response_body: &str, call: u32, captured: Arc<Mutex<Option<String>>>) {
+fn handle_sequenced_request(mut stream: TcpStream, response_body: &str, call: u32, captured: &Arc<Mutex<Option<String>>>) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut data = Vec::new();
-    let mut buf = [0u8; 4096];
+    let mut buf = [0_u8; 4096];
     loop {
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -92,7 +92,8 @@ fn handle_sequenced_request(mut stream: TcpStream, response_body: &str, call: u3
         }
         let raw = String::from_utf8_lossy(&data);
         if let Some(header_end) = raw.find("\r\n\r\n") {
-            let content_length: usize = raw[..header_end]
+            let content_length: usize = raw.get(..header_end)
+                .unwrap_or("")
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("content-length:"))
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().parse().ok()))
