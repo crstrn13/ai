@@ -118,12 +118,8 @@ impl CompactFilter {
     ///
     /// Returns [`FilterError`] if config validation fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
-        let validated = build_config(&cfg)?;
-        Ok(Box::new(Self {
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
-            config: validated,
-        }))
+        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::build(config, client)
     }
 
     /// Create a filter from parsed YAML config using a shared sub-request client.
@@ -135,8 +131,14 @@ impl CompactFilter {
         config: &serde_yaml::Value,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client)
+    }
+
+    /// Shared constructor: parse config, validate, eager-init tiktoken, and box.
+    fn build(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
         let validated = build_config(&cfg)?;
+        eager_init_tiktoken(&validated.tiktoken_encoding);
         Ok(Box::new(Self {
             client,
             config: validated,
@@ -321,7 +323,11 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
         if entry_type != "compaction" {
             continue;
         }
-        let Some(compact_threshold) = entry.get("compact_threshold").and_then(Value::as_u64) else {
+        let Some(raw_threshold) = entry.get("compact_threshold") else {
+            continue;
+        };
+        let Some(compact_threshold) = raw_threshold.as_u64() else {
+            warn!(value = %raw_threshold, "compact_threshold is not a valid integer, skipping compaction");
             continue;
         };
         let compaction_model = entry
@@ -336,22 +342,34 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
     None
 }
 
+/// Resolve the tiktoken singleton for the given encoding name.
+fn resolve_tiktoken(encoding: &str) -> Option<&'static tiktoken_rs::CoreBPE> {
+    match encoding {
+        "cl100k_base" => Some(tiktoken_rs::cl100k_base_singleton()),
+        "o200k_base" => Some(tiktoken_rs::o200k_base_singleton()),
+        other => {
+            warn!(encoding = other, "unknown tiktoken encoding, cannot estimate tokens");
+            None
+        },
+    }
+}
+
+/// Pre-load the tiktoken BPE singleton at pipeline build time so the
+/// first request does not pay the ~100ms merge-rule loading cost.
+fn eager_init_tiktoken(encoding: &str) {
+    resolve_tiktoken(encoding);
+}
+
 /// Estimate the token count for the given messages using tiktoken.
 ///
 /// Uses the configured encoding (e.g. `cl100k_base`, `o200k_base`)
-/// to tokenize the serialized conversation text.
+/// to tokenize the serialized conversation text. Runs inside
+/// `block_in_place` because BPE tokenization is CPU-bound.
 ///
 /// Returns `None` if the encoding name is not recognized.
 fn get_token_count(conversation_text: &str, tiktoken_encoding: &str) -> Option<u64> {
-    let bpe = match tiktoken_encoding {
-        "cl100k_base" => tiktoken_rs::cl100k_base_singleton(),
-        "o200k_base" => tiktoken_rs::o200k_base_singleton(),
-        other => {
-            warn!(encoding = other, "unknown tiktoken encoding, cannot estimate tokens");
-            return None;
-        },
-    };
-    let count = bpe.count_ordinary(conversation_text) as u64;
+    let bpe = resolve_tiktoken(tiktoken_encoding)?;
+    let count = tokio::task::block_in_place(|| bpe.count_ordinary(conversation_text)) as u64;
     debug!(
         count,
         source = "tiktoken",
@@ -444,7 +462,7 @@ fn build_compaction_item(id: &str, summary: &str) -> Value {
 /// - `state.messages` = `[compaction_item, ...state.input]`
 /// - `state.persisted_messages` = `[compaction_item, ...state.input]`
 ///
-/// The compaction item is `{"type": "compaction", "summary": "..."}`.
+/// The compaction item is `{"type": "compaction", "encrypted_content": "<base64>"}`.
 /// `state.input` holds the current request's input items (unchanged
 /// by rehydrate), so the current turn's messages are preserved.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {

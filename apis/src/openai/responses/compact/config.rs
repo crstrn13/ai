@@ -31,8 +31,8 @@ pub(super) struct CompactFilterConfig {
     #[serde(default = "default_model")]
     pub default_model: String,
 
-    /// Tiktoken encoding name for local token estimation.
-    /// Used as fallback when `previous_usage` is unavailable.
+    /// Tiktoken encoding name for local token estimation of the
+    /// conversation text.
     #[serde(default = "default_tiktoken_encoding")]
     pub tiktoken_encoding: String,
 
