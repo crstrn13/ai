@@ -270,7 +270,7 @@ fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json
 ///
 /// Returns `Cow::Borrowed` when no compaction items are present, avoiding
 /// allocation. When compaction items exist, returns `Cow::Owned` with each
-/// `{"type": "compaction", "summary": "..."}` translated to an assistant
+/// `{"type": "compaction", "encrypted_content": "<base64>"}` translated to an assistant
 /// message — backends do not understand our internal compaction format.
 fn messages_for_backend(messages: &[serde_json::Value]) -> Cow<'_, [serde_json::Value]> {
     let mut translated: Option<Vec<serde_json::Value>> = None;
