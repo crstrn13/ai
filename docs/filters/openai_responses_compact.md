@@ -11,7 +11,7 @@ Summarizes conversation history when the token count exceeds a configured thresh
 |-------|------|---------|-------------|
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
-| `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation. Used as fallback when `previous_usage` is unavailable. |
+| `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `callout_failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
