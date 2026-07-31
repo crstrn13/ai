@@ -85,6 +85,14 @@ struct CompactionParams {
 /// Summarizes conversation history when the token count exceeds a
 /// configured threshold.
 ///
+/// `compact_threshold` in `context_management` must be an integer.
+/// Floating-point values (e.g. `0.9`) are ignored and compaction
+/// is skipped.
+///
+/// Compaction only applies to multi-turn requests where
+/// `openai_responses_rehydrate` has loaded stored conversation
+/// history. Single-turn requests are released without compaction.
+///
 /// # YAML
 ///
 /// ```yaml

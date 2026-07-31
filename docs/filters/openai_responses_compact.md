@@ -5,6 +5,12 @@
 
 Summarizes conversation history when the token count exceeds a configured threshold.
 
+## Configuration Notes
+
+`compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
+
+Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -15,11 +21,6 @@ Summarizes conversation history when the token count exceeds a configured thresh
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `callout_failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
-
-## Notes
-
-- `compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
-- Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
 
 ## Examples
 
