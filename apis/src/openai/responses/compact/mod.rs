@@ -126,6 +126,20 @@ impl CompactFilter {
         }))
     }
 
+    /// Create a filter from parsed YAML config using a shared sub-request client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if config validation fails.
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
+        let validated = build_config(&cfg)?;
+        Ok(Box::new(Self { client, config: validated }))
+    }
+
     /// Run the summarization callout and return the summary text.
     ///
     /// Returns `Ok(Some(summary))` on success, `Ok(None)` when
