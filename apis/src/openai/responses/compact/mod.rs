@@ -241,13 +241,12 @@ impl HttpFilter for CompactFilter {
             return Ok(FilterAction::Release);
         }
         let streaming = is_streaming(ctx);
-        // ResponsesState is only present for multi-turn requests resolved
-        // by rehydrate (previous_response_id or conversation). Single-turn
-        // requests are intentionally skipped — there is no prior history to
-        // compact.
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
+        if !state.history_rehydrated {
+            return Ok(FilterAction::Release);
+        }
         let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding) else {
             return Ok(FilterAction::Release);
         };
