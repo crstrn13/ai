@@ -284,13 +284,29 @@ impl HttpFilter for CompactFilter {
 ///
 /// Returns `None` if there is no compaction config, the encoding is
 /// unknown, or the token count is below the threshold.
+///
+/// The token estimate includes instructions and tool definitions in
+/// addition to conversation messages, since all three contribute to
+/// the rendered context sent to the model.
 fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
     let params = extract_compaction_config(&state.context_management)?;
+
     let conversation_text = build_conversation_text(&state.messages);
-    let token_count = get_token_count(&conversation_text, tiktoken_encoding)?;
+    let message_tokens = get_token_count(&conversation_text, tiktoken_encoding)?;
+
+    let overhead_text = build_context_overhead_text(state);
+    let overhead_tokens = if overhead_text.is_empty() {
+        0
+    } else {
+        get_token_count(&overhead_text, tiktoken_encoding).unwrap_or(0)
+    };
+
+    let token_count = message_tokens + overhead_tokens;
     if token_count <= params.compact_threshold {
         debug!(
             token_count,
+            message_tokens,
+            overhead_tokens,
             threshold = params.compact_threshold,
             "under threshold, skipping"
         );
@@ -298,10 +314,28 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
     }
     debug!(
         token_count,
+        message_tokens,
+        overhead_tokens,
         threshold = params.compact_threshold,
         "threshold exceeded, compacting"
     );
     Some((params, conversation_text))
+}
+
+/// Build the text for instructions and tool definitions that live
+/// outside the message list but still consume context window tokens.
+fn build_context_overhead_text(state: &ResponsesState) -> String {
+    let mut buf = String::new();
+    if let Some(instructions) = state.request_body.get("instructions").and_then(Value::as_str) {
+        buf.push_str(instructions);
+    }
+    for tool in &state.tools {
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&tool.to_string());
+    }
+    buf
 }
 
 /// Check whether this is an OpenAI Responses API request.
