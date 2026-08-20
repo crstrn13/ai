@@ -65,6 +65,7 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+| [`publisher_model_rewrite`](publisher_model_rewrite.md) | Strips the `publishers/{namespace}/models/` prefix from the request body's `model` field. |
 
 ### Prompt Enrich
 

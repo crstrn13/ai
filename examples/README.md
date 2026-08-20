@@ -54,6 +54,7 @@ before sending requests.
 | File | Description |
 | ------ | ------------- |
 | [fallback-with-translation.yaml](configs/inference/fallback-with-translation.yaml) | Demonstrates provider failover with Responses-to-Chat Completions protocol translation using the iterative_request_router |
+| [publisher-model-rewrite.yaml](configs/inference/publisher-model-rewrite.yaml) | Strips the `publishers/{namespace}/models/` prefix from the request body's `model` field before the request reaches the upstream |
 
 ### OpenAI
 

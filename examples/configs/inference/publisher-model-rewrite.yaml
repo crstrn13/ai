@@ -1,0 +1,65 @@
+# Publisher Model Name Rewrite
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
+# Strips the `publishers/{namespace}/models/` prefix from the
+# request body's `model` field before the request reaches the
+# upstream. The full model path is preserved in the
+# X-Gateway-Model-Name routing header so HTTPRoute matching
+# is unaffected.
+#
+# Example request:
+#
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "publishers/llm-internal/models/facebook/opt-125m",
+#          "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# The model_to_header filter copies the full path to
+# X-Gateway-Model-Name for routing. The publisher_model_rewrite
+# filter then rewrites the body so the upstream receives
+# "model": "facebook/opt-125m".
+
+listeners:
+  - name: inference-gateway
+    address: "0.0.0.0:8080" # dev value; binds all interfaces
+    filter_chains:
+      - extract-and-rewrite
+      - routing
+
+filter_chains:
+  # Extract the full model path for routing, then strip the
+  # publisher prefix so the upstream gets the bare model name.
+  - name: extract-and-rewrite
+    filters:
+      - filter: model_to_header
+        header: X-Gateway-Model-Name
+      - filter: publisher_model_rewrite
+
+  # Route based on the full publisher model path.
+  - name: routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-gateway-model-name: "publishers/llm-internal/models/facebook/opt-125m"
+            cluster: vllm-opt
+          - path_prefix: "/"
+            headers:
+              x-gateway-model-name: "publishers/llm-internal/models/mistral-7b-instruct"
+            cluster: vllm-mistral
+          - path_prefix: "/"
+            cluster: default
+      - filter: load_balancer
+        clusters:
+          - name: vllm-opt
+            endpoints:
+              - "10.0.1.1:8080"
+          - name: vllm-mistral
+            endpoints:
+              - "10.0.2.1:8080"
+          - name: default
+            endpoints:
+              - "10.0.3.1:8080"
