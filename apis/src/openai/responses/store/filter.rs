@@ -213,6 +213,18 @@ impl ResponseStoreFilter {
         }
     }
 
+    /// Best-effort store init for the explicit compact endpoint.
+    ///
+    /// The compact filter handles a missing store with its own error,
+    /// so a failed init here does not reject the request.
+    async fn try_init_store_for_compact(&self, ctx: &HttpFilterContext<'_>) {
+        if request_is_explicit_compact(ctx)
+            && let Some(store) = &self.get_or_init_store().await
+        {
+            register_store_in_context(ctx, store);
+        }
+    }
+
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
     async fn handle_delete(&self, tenant_id: &str, id: &str) -> Result<FilterAction, FilterError> {
         let Some(store) = self.ensure_store().await else {
@@ -463,6 +475,12 @@ fn should_skip(ctx: &HttpFilterContext<'_>) -> bool {
 /// Check whether this request should initialize the store.
 fn should_init_store_for_request(ctx: &HttpFilterContext<'_>) -> bool {
     request_will_persist_response(ctx) || request_needs_rehydrate_store(ctx)
+}
+
+/// Check whether this is an explicit `POST /v1/responses/compact` request.
+fn request_is_explicit_compact(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
 
 /// Check whether this request can persist the eventual response.
@@ -720,6 +738,7 @@ impl HttpFilter for ResponseStoreFilter {
         }
 
         if !should_init_store_for_request(ctx) {
+            self.try_init_store_for_compact(ctx).await;
             return Ok(FilterAction::Continue);
         }
 
@@ -753,6 +772,8 @@ impl HttpFilter for ResponseStoreFilter {
                 Some(store) => register_store_in_context(ctx, store),
                 None => return Ok(FilterAction::Reject(reject_store_error())),
             }
+        } else {
+            self.try_init_store_for_compact(ctx).await;
         }
         Ok(FilterAction::Continue)
     }

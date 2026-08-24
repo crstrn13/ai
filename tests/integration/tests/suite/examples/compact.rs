@@ -15,8 +15,8 @@ use std::{
 };
 
 use praxis_test_utils::{
-    Backend, TempSqlite, bind_unique_port, example_config_path, free_port, http_send, json_post, parse_status,
-    patch_yaml, start_proxy,
+    Backend, TempSqlite, bind_unique_port, example_config_path, free_port, http_send, json_post, parse_body,
+    parse_status, patch_yaml, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -327,4 +327,65 @@ fn compact_direct_input_compacts_full_conversation() {
         content.contains("Previous conversation summary"),
         "summary should include the default prefix"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint() {
+    // Phase 1: store a response via normal inference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_explicit");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: POST /v1/responses/compact with the stored response_id.
+    // The summarization callout goes to inference_url (same backend address).
+    let backend2 = Backend::fixed(CHAT_COMPLETIONS_RESPONSE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"response_id":"resp_compact","model":"gpt-4.1"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw2),
+        200,
+        "explicit compact should return 200"
+    );
+
+    let body = parse_body(&raw2);
+    let resp: serde_json::Value =
+        serde_json::from_str(&body).expect("response should be valid JSON");
+    assert_eq!(resp["object"], "response", "should be a response object");
+    assert_eq!(resp["status"], "completed");
+    assert_eq!(
+        resp["previous_response_id"], "resp_compact",
+        "should reference the original response"
+    );
+    let output = resp["output"].as_array().expect("output should be an array");
+    assert_eq!(output.len(), 1, "output should have one compaction item");
+    assert_eq!(output[0]["type"], "compaction");
+    assert!(
+        output[0].get("encrypted_content").is_some(),
+        "compaction item should have encrypted_content"
+    );
+    drop(proxy2);
 }

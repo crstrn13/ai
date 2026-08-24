@@ -94,9 +94,16 @@ struct CompactionParams {
 /// Floating-point values (e.g. `0.9`) are ignored and compaction
 /// is skipped.
 ///
-/// Compaction only applies to multi-turn requests where
-/// `openai_responses_rehydrate` has loaded stored conversation
-/// history. Single-turn requests are released without compaction.
+/// Compaction applies in three scenarios:
+///
+/// - **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
+///
+/// - **Direct input** — full conversation in `input` with a `context_management` compaction entry but no stored history. The entire input is summarized.
+///
+/// - **Explicit compact** — `POST /v1/responses/compact` with a `response_id`. Loads stored messages, summarizes them, and persists a new compacted response.
+///
+/// Requests without rehydrated history or a compaction config are
+/// released without compaction.
 ///
 /// # YAML
 ///
@@ -402,7 +409,15 @@ impl HttpFilter for CompactFilter {
 
 /// Returns `true` when compaction should proceed.
 fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
-    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+    is_compactable(ctx.extensions.get::<ResponsesState>())
+}
+
+/// Check whether the given state qualifies for compaction.
+///
+/// Returns `true` when either rehydrated history is present or the
+/// request carries a direct `context_management` compaction config.
+fn is_compactable(state: Option<&ResponsesState>) -> bool {
+    let Some(state) = state else {
         return false;
     };
     if state.history_rehydrated {
@@ -430,9 +445,10 @@ fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
 fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
     let params = extract_compaction_config(&state.context_management)?;
     let history = if state.history_rehydrated {
-        &state.messages[..state.messages.len() - state.input.len()]
+        let end = state.messages.len().saturating_sub(state.input.len());
+        state.messages.get(..end).unwrap_or(&state.messages)
     } else {
-        &state.messages[..]
+        &state.messages
     };
 
     if let Some(token_count) = previous_usage_total(state) {

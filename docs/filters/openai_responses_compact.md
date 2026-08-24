@@ -9,7 +9,15 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 `compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
 
-Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
+Compaction applies in three scenarios:
+
+- **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
+
+- **Direct input** — full conversation in `input` with a `context_management` compaction entry but no stored history. The entire input is summarized.
+
+- **Explicit compact** — `POST /v1/responses/compact` with a `response_id`. Loads stored messages, summarizes them, and persists a new compacted response.
+
+Requests without rehydrated history or a compaction config are released without compaction.
 
 ## Configuration
 
