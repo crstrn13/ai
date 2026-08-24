@@ -429,16 +429,21 @@ fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
 /// the threshold, we compact before sending this turn.
 fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
     let params = extract_compaction_config(&state.context_management)?;
+    let history = if state.history_rehydrated {
+        &state.messages[..state.messages.len() - state.input.len()]
+    } else {
+        &state.messages[..]
+    };
 
     if let Some(token_count) = previous_usage_total(state) {
         if !exceeds_threshold(token_count, &params) {
             return None;
         }
-        return Some((params, build_conversation_text(&state.messages)));
+        return Some((params, build_conversation_text(history)));
     }
 
     debug!("previous_usage unavailable, falling back to tiktoken estimation");
-    let conversation_text = build_conversation_text(&state.messages);
+    let conversation_text = build_conversation_text(history);
     let overhead = build_context_overhead_text(&state.request_body);
     let full_text = format!("{conversation_text}\n\n{overhead}");
     let token_count = get_token_count(&full_text, tiktoken_encoding)?;
