@@ -10,6 +10,7 @@ pub use test_utils::load_example_config;
 mod agentic_routing;
 mod anthropic_messages;
 mod anthropic_messages_web_search;
+mod aws_sigv4;
 mod compact;
 mod credential_injection;
 mod file_search_callout;
@@ -17,6 +18,10 @@ mod full_flow;
 mod full_flow_agentic;
 mod guardrails;
 mod inference_fallback;
+#[cfg(feature = "http-callout-filter")]
+mod lakera_guard;
+#[cfg(feature = "llmd-ext-proc")]
+mod llmd_ext_proc;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;

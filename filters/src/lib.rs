@@ -9,6 +9,9 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+pub mod aws;
+#[cfg(feature = "http-callout-filter")]
+pub mod callout;
 pub mod guardrails;
 pub mod inference;
 #[cfg(feature = "opentelemetry")]
@@ -20,6 +23,9 @@ mod time_to_first_token;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+pub use aws::Sigv4SignFilter;
+#[cfg(feature = "http-callout-filter")]
+pub use callout::HttpCalloutFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
