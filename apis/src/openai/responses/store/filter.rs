@@ -479,8 +479,7 @@ fn should_init_store_for_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether this is an explicit `POST /v1/responses/compact` request.
 fn request_is_explicit_compact(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST
-        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
 
 /// Check whether this request can persist the eventual response.

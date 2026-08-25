@@ -365,15 +365,10 @@ async fn compact_explicit_endpoint() {
             r#"{"response_id":"resp_compact","model":"gpt-4.1"}"#,
         ),
     );
-    assert_eq!(
-        parse_status(&raw2),
-        200,
-        "explicit compact should return 200"
-    );
+    assert_eq!(parse_status(&raw2), 200, "explicit compact should return 200");
 
     let body = parse_body(&raw2);
-    let resp: serde_json::Value =
-        serde_json::from_str(&body).expect("response should be valid JSON");
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
     assert_eq!(resp["object"], "response", "should be a response object");
     assert_eq!(resp["status"], "completed");
     assert_eq!(
