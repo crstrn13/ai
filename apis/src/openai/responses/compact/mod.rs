@@ -502,7 +502,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 }
 
 /// Check whether this is an explicit `POST /v1/responses/compact` request.
-fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
+pub(super) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
 
