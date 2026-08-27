@@ -94,19 +94,17 @@ struct CompactionParams {
 /// Floating-point values (e.g. `0.9`) are ignored and compaction
 /// is skipped.
 ///
-/// Compaction applies in three scenarios:
+/// Compaction applies in two scenarios:
 ///
 /// - **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored
 ///   history is summarized; the current turn is preserved.
 ///
-/// - **Direct input** — full conversation in `input` with a `context_management` compaction entry but no stored
-///   history. The entire input is summarized.
-///
 /// - **Explicit compact** — `POST /v1/responses/compact` with a `response_id`. Loads stored messages, summarizes them,
 ///   and persists a new compacted response.
 ///
-/// Requests without rehydrated history or a compaction config are
-/// released without compaction.
+/// Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because
+/// `state.input == state.messages` — there is no separable "current turn" to preserve after summarization.
+/// Requests without rehydrated history are released without compaction.
 ///
 /// # YAML
 ///
@@ -415,22 +413,18 @@ fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
     is_compactable(ctx.extensions.get::<ResponsesState>())
 }
 
-/// Check whether the given state qualifies for compaction.
+/// Check whether the given state qualifies for reactive compaction.
 ///
-/// Returns `true` when either rehydrated history is present or the
-/// request carries a direct `context_management` compaction config.
+/// Returns `true` only when rehydrated history is present. Direct
+/// input requests (no `previous_response_id`) are skipped because
+/// `state.input == state.messages` — there is no separable "current
+/// turn" to preserve after summarization. Use the explicit
+/// `POST /v1/responses/compact` endpoint for non-rehydrated history.
 fn is_compactable(state: Option<&ResponsesState>) -> bool {
     let Some(state) = state else {
         return false;
     };
-    if state.history_rehydrated {
-        return true;
-    }
-    if extract_compaction_config(&state.context_management).is_some() {
-        debug!("direct input compaction path, no rehydration");
-        return true;
-    }
-    false
+    state.history_rehydrated
 }
 
 /// Check whether compaction should run and return the params + text.

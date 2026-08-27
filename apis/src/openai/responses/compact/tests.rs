@@ -805,14 +805,14 @@ fn is_compactable_returns_true_when_rehydrated() {
 }
 
 #[test]
-fn is_compactable_returns_true_for_direct_input_with_compaction_config() {
+fn is_compactable_returns_false_for_direct_input_with_compaction_config() {
     let state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
         "input": [{"role": "user", "content": "Hello"}],
         "context_management": [{"type": "compaction", "compact_threshold": 100}]
     }));
     assert!(!state.history_rehydrated, "precondition: not rehydrated");
-    assert!(is_compactable(Some(&state)));
+    assert!(!is_compactable(Some(&state)));
 }
 
 #[test]
