@@ -384,6 +384,9 @@ impl HttpFilter for CompactFilter {
             return Ok(FilterAction::Release);
         }
         let streaming = is_streaming(ctx);
+        if let Some(action) = reject_invalid_compaction_config(ctx, streaming) {
+            return Ok(action);
+        }
         if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
@@ -411,6 +414,25 @@ fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
     is_compactable(ctx.extensions.get::<ResponsesState>())
 }
 
+/// Reject the request when a compaction config is present but invalid.
+///
+/// Runs for every Responses request so an invalid `compact_threshold` is
+/// rejected even when reactive compaction is ultimately skipped (e.g. direct
+/// input without a rehydrated history to separate from the current turn).
+/// Returns `None` when there is no config, or the config is valid.
+fn reject_invalid_compaction_config(ctx: &HttpFilterContext<'_>, streaming: bool) -> Option<FilterAction> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    match extract_compaction_config(&state.context_management) {
+        Ok(_) => None,
+        Err(msg) => Some(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            &msg,
+            streaming,
+        ))),
+    }
+}
+
 /// Check whether the given state qualifies for reactive compaction.
 ///
 /// Returns `true` only when rehydrated history is present. Direct
@@ -419,11 +441,13 @@ fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
 /// turn" to preserve after summarization. Use the explicit
 /// `POST /v1/responses/compact` endpoint for non-rehydrated history.
 ///
-/// This gate is the single decision point for direct-input handling:
-/// `should_compact` and `replace_messages` retain direct-input branches
-/// (and unit tests for them) documenting the lower-level contract, but
-/// those branches are unreachable through the filter while this returns
-/// `false` for non-rehydrated state.
+/// This gate is the single decision point for direct-input handling.
+/// `should_compact` still evaluates the threshold for direct input (and
+/// unit tests exercise that lower-level contract directly), but the
+/// summarization it would trigger is unreachable through the filter while
+/// this returns `false` for non-rehydrated state. Threshold *validation*
+/// is separate: `reject_invalid_compaction_config` runs before this gate,
+/// so an invalid `compact_threshold` is rejected for direct input too.
 fn is_compactable(state: Option<&ResponsesState>) -> bool {
     let Some(state) = state else {
         return false;
@@ -453,12 +477,11 @@ fn should_compact(
     let Some(params) = extract_compaction_config(&state.context_management)? else {
         return Ok(None);
     };
-    let history = if state.history_rehydrated {
-        let end = state.messages.len().saturating_sub(state.input.len());
-        state.messages.get(..end).unwrap_or(&state.messages)
-    } else {
-        &state.messages
-    };
+    // Summarize the full conversation, including the current turn, so the
+    // summarizer has complete context. The current turn is not lost from the
+    // rehydrated history: `replace_messages` preserves it verbatim after the
+    // compaction item via a tail split, so it appears exactly once.
+    let history = &state.messages;
 
     if let Some(token_count) = previous_usage_total(state) {
         if !exceeds_threshold(token_count, &params) {

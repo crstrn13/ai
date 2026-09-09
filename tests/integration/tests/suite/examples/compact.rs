@@ -579,17 +579,16 @@ fn compact_direct_input_skips_reactive_compaction() {
     let config = load_compact_config(&yaml, "sqlite::memory:", proxy_port, backend.port());
     let proxy = start_proxy(&config);
 
-    // Send a full conversation in `input` with context_management but
-    // no previous_response_id. Reactive compaction is skipped because
-    // state.input == state.messages — there is no separable "current
-    // turn" to preserve after summarization.
-    let raw = http_send(
-        proxy.addr(),
-        &json_post(
-            "/v1/responses",
-            r#"{"model":"gpt-4.1","input":[{"role":"user","content":"Explain TCP vs UDP in detail"},{"role":"assistant","content":"TCP is a connection-oriented protocol."},{"role":"user","content":"Compare with QUIC"}],"context_management":[{"type":"compaction","compact_threshold":50}]}"#,
-        ),
+    // Send a full conversation in `input` with a valid compaction config
+    // whose token count exceeds the threshold, but no previous_response_id.
+    // Reactive compaction is still skipped because state.input ==
+    // state.messages — there is no separable "current turn" to preserve
+    // after summarization — so the request passes through untouched.
+    let padding = "context padding ".repeat(700);
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":[{{"role":"user","content":"Explain TCP vs UDP in detail"}},{{"role":"assistant","content":"TCP is a connection-oriented protocol. {padding}"}},{{"role":"user","content":"Compare with QUIC"}}],"context_management":[{{"type":"compaction","compact_threshold":1000}}]}}"#
     );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
         parse_status(&raw),
         200,
