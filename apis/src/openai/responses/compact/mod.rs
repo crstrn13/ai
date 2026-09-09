@@ -15,8 +15,8 @@
 //! # Scope
 //!
 //! Compaction only applies to **multi-turn requests** where
-//! `openai_responses_rehydrate` has loaded stored conversation history
-//! - i.e. requests that include `previous_response_id` or
+//! `openai_responses_rehydrate` has loaded stored conversation history,
+//! i.e. requests that include `previous_response_id` or
 //! `conversation`. Single-turn requests (no stored history, even with
 //! `context_management` set) are released without compaction because
 //! there is no prior history to summarize.
