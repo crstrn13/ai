@@ -688,6 +688,11 @@ async fn build_and_persist_compaction(
                 &filter.config.summary_prefix,
             )])
         },
+        // Fail-open pass-through: the summarization callout failed but
+        // `on_failure: open` is configured, so instead of erroring we return the
+        // conversation uncompacted. `usage.output_tokens` is 0 because no summary
+        // was produced (see `build_compaction_usage`); the caller can detect the
+        // no-op by the absence of a `compaction` item in `output`.
         None => Value::Array(messages.to_vec()),
     };
     let usage = build_compaction_usage(messages, summary, &filter.config.tiktoken_encoding);
@@ -768,7 +773,7 @@ fn build_usage(input_tokens: u64, cached_tokens: u64, output_tokens: u64, reason
         "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": input_tokens.saturating_add(output_tokens),
     })
 }
 
@@ -783,45 +788,46 @@ fn reject_compact(status: u16, code: &str, message: &str) -> FilterAction {
 /// `[{"type": "compaction", "compact_threshold": 50000}]`
 ///
 /// Returns:
-/// - `Ok(None)` if no compaction entry is present.
+/// - `Ok(None)` if `context_management` is absent, `null`, or an array with no compaction entry.
 /// - `Ok(Some(params))` if a valid compaction entry is present.
-/// - `Err(msg)` if a compaction entry is present but has an invalid `compact_threshold` or `compaction_model`.
+/// - `Err(msg)` if `context_management` is present but not an array, or a compaction entry has an invalid
+///   `compact_threshold` or `compaction_model`.
 fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams>, String> {
-    let Some(array) = context_management.as_ref().and_then(Value::as_array) else {
+    // Absent or explicit null: OpenAI treats both as "no context management".
+    let Some(value) = context_management.as_ref().filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-
+    let Some(array) = value.as_array() else {
+        return Err("context_management must be an array".to_owned());
+    };
     for entry in array {
-        let Some(entry_type) = entry.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if entry_type != "compaction" {
-            continue;
+        if entry.get("type").and_then(Value::as_str) == Some("compaction") {
+            return parse_compaction_entry(entry).map(Some);
         }
-
-        let err_msg = "compact_threshold must be an integer of at least 1000";
-        let raw_threshold = entry.get("compact_threshold").ok_or_else(|| err_msg.to_owned())?;
-        let compact_threshold = raw_threshold.as_u64().ok_or_else(|| err_msg.to_owned())?;
-        if compact_threshold < MIN_COMPACT_THRESHOLD {
-            return Err(err_msg.to_owned());
-        }
-
-        let compaction_model = if let Some(m) = entry.get("compaction_model") {
-            let model_str = m
-                .as_str()
-                .ok_or_else(|| "compaction_model must be a string".to_owned())?;
-            Some(model_str.to_owned())
-        } else {
-            None
-        };
-
-        return Ok(Some(CompactionParams {
-            compact_threshold,
-            compaction_model,
-        }));
     }
-
     Ok(None)
+}
+
+/// Parse a single `{"type": "compaction", ...}` entry into [`CompactionParams`].
+fn parse_compaction_entry(entry: &Value) -> Result<CompactionParams, String> {
+    let err_msg = "compact_threshold must be an integer of at least 1000";
+    let raw_threshold = entry.get("compact_threshold").ok_or_else(|| err_msg.to_owned())?;
+    let compact_threshold = raw_threshold.as_u64().ok_or_else(|| err_msg.to_owned())?;
+    if compact_threshold < MIN_COMPACT_THRESHOLD {
+        return Err(err_msg.to_owned());
+    }
+    let compaction_model = match entry.get("compaction_model") {
+        Some(m) => Some(
+            m.as_str()
+                .ok_or_else(|| "compaction_model must be a string".to_owned())?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    Ok(CompactionParams {
+        compact_threshold,
+        compaction_model,
+    })
 }
 
 /// Resolve the tiktoken singleton for the given encoding name.

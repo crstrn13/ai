@@ -163,6 +163,25 @@ fn extract_compaction_config_none() {
 }
 
 #[test]
+fn extract_compaction_config_null_is_treated_as_absent() {
+    let cm = Some(json!(null));
+    assert!(
+        extract_compaction_config(&cm).unwrap().is_none(),
+        "explicit null context_management should behave like an omitted field"
+    );
+}
+
+#[test]
+fn extract_compaction_config_non_array_returns_error() {
+    let cm = Some(json!({"type": "compaction", "compact_threshold": 1000}));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(
+        err.contains("context_management must be an array"),
+        "a present but non-array context_management must be rejected, got: {err}"
+    );
+}
+
+#[test]
 fn extract_compaction_config_empty_array() {
     let cm = Some(json!([]));
     assert!(extract_compaction_config(&cm).unwrap().is_none());
