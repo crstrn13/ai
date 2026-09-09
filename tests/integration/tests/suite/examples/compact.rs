@@ -18,6 +18,7 @@ use praxis_test_utils::{
     Backend, TempSqlite, bind_unique_port, example_config_path, free_port, http_send, json_post, parse_body,
     parse_status, patch_yaml, start_proxy,
 };
+use sqlx::Row as _;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -28,10 +29,19 @@ use praxis_test_utils::{
 const FIRST_RESPONSE_JSON: &str = r#"{"id":"resp_compact","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","input":"Explain TCP vs UDP","output":[{"type":"message","content":[{"type":"output_text","text":"TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability. TCP is a connection-oriented protocol that provides reliable, ordered delivery of data. It establishes a connection through a three-way handshake before transmitting data. UDP is a connectionless protocol that sends data without establishing a connection first. TCP guarantees delivery through acknowledgments and retransmissions while UDP does not. TCP is used for applications requiring reliability like web browsing and email while UDP is used for real-time applications like video streaming and gaming where speed matters more than reliability."}]}]}"#;
 
 /// Chat Completions response used for the summarization callout.
-const CHAT_COMPLETIONS_RESPONSE: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary of the conversation."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60}}"#;
+///
+/// Carries the full `CompletionUsage` shape — including
+/// `prompt_tokens_details.cached_tokens` and
+/// `completion_tokens_details.reasoning_tokens` — so tests can verify those
+/// counts are threaded into the compaction `ResponseUsage`.
+const CHAT_COMPLETIONS_RESPONSE: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary of the conversation."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":3}}}"#;
 
 /// Responses API response returned for the main inference call.
 const INFERENCE_RESPONSE: &str = r#"{"id":"resp_inf","created_at":2000,"model":"gpt-4.1","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"QUIC is faster."}]}]}"#;
+
+/// Summarization callout response that omits the `usage` object, forcing the
+/// compaction usage to fall back to a tiktoken estimate.
+const CHAT_COMPLETIONS_NO_USAGE: &str = r#"{"id":"chatcmpl-2","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary of the conversation."},"finish_reason":"stop"}]}"#;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -121,6 +131,41 @@ fn handle_sequenced_request(
         response_body
     );
     drop(stream.write_all(response.as_bytes()));
+}
+
+/// Assert a `usage` object carries every field the OpenAI `ResponseUsage`
+/// schema marks as required (including the nested detail objects).
+fn assert_response_usage_contract(usage: &serde_json::Value) {
+    assert!(usage["input_tokens"].is_u64(), "usage.input_tokens required: {usage}");
+    assert!(usage["output_tokens"].is_u64(), "usage.output_tokens required: {usage}");
+    assert!(usage["total_tokens"].is_u64(), "usage.total_tokens required: {usage}");
+    let input_details = &usage["input_tokens_details"];
+    assert!(
+        input_details["cached_tokens"].is_u64(),
+        "input_tokens_details.cached_tokens required: {usage}"
+    );
+    assert!(
+        input_details["cache_write_tokens"].is_u64(),
+        "input_tokens_details.cache_write_tokens required: {usage}"
+    );
+    assert!(
+        usage["output_tokens_details"]["reasoning_tokens"].is_u64(),
+        "output_tokens_details.reasoning_tokens required: {usage}"
+    );
+}
+
+/// Assert a compaction `output` item carries every field the OpenAI
+/// `CompactionBody` schema marks as required.
+fn assert_compaction_item_contract(item: &serde_json::Value) {
+    assert_eq!(item["type"], "compaction", "compaction item type: {item}");
+    assert!(
+        item["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "compaction item requires a non-empty id: {item}"
+    );
+    assert!(
+        item["encrypted_content"].as_str().is_some_and(|c| !c.is_empty()),
+        "compaction item requires encrypted_content: {item}"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -389,25 +434,331 @@ async fn compact_explicit_endpoint() {
         proxy2.addr(),
         &json_post(
             "/v1/responses/compact",
-            r#"{"response_id":"resp_compact","model":"gpt-4.1"}"#,
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_compact"}"#,
         ),
     );
     assert_eq!(parse_status(&raw2), 200, "explicit compact should return 200");
 
     let body = parse_body(&raw2);
     let resp: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
-    assert_eq!(resp["object"], "response", "should be a response object");
-    assert_eq!(resp["status"], "completed");
     assert_eq!(
-        resp["previous_response_id"], "resp_compact",
-        "should reference the original response"
+        resp["object"], "response.compaction",
+        "should be a response.compaction object per the OpenAI contract"
+    );
+    // CompactResource required fields: id, object, output, created_at, usage.
+    assert!(resp["id"].is_string(), "compaction response must have an id");
+    assert!(
+        resp["created_at"].is_number(),
+        "compaction response must have created_at"
     );
     let output = resp["output"].as_array().expect("output should be an array");
     assert_eq!(output.len(), 1, "output should have one compaction item");
-    assert_eq!(output[0]["type"], "compaction");
-    assert!(
-        output[0].get("encrypted_content").is_some(),
-        "compaction item should have encrypted_content"
+    assert_compaction_item_contract(&output[0]);
+
+    let usage = &resp["usage"];
+    assert_response_usage_contract(usage);
+    // Usage is threaded through from the summarization callout, not re-estimated.
+    // CHAT_COMPLETIONS_RESPONSE reports prompt=50, completion=10, total=60 with
+    // cached_tokens=5 and reasoning_tokens=3 in its detail objects.
+    assert_eq!(usage["input_tokens"], 50, "input_tokens must reflect callout usage");
+    assert_eq!(usage["output_tokens"], 10, "output_tokens must reflect callout usage");
+    assert_eq!(usage["total_tokens"], 60, "total_tokens must reflect callout usage");
+    assert_eq!(
+        usage["input_tokens_details"]["cached_tokens"], 5,
+        "cached_tokens must be threaded from the callout's prompt_tokens_details"
+    );
+    assert_eq!(
+        usage["output_tokens_details"]["reasoning_tokens"], 3,
+        "reasoning_tokens must be threaded from the callout's completion_tokens_details"
     );
     drop(proxy2);
+
+    // The explicit endpoint persists the compaction record. Read it back and
+    // confirm the stored row matches the returned response and is itself
+    // contract-shaped.
+    let returned_id = resp["id"].as_str().expect("response id should be a string");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let row = sqlx::query("SELECT tenant_id, model, response_object, messages FROM openai_responses WHERE id = ?")
+        .bind(returned_id)
+        .fetch_one(&pool)
+        .await
+        .expect("compaction record should be persisted");
+    pool.close().await;
+
+    let tenant_id: String = row.get("tenant_id");
+    let model: String = row.get("model");
+    assert_eq!(tenant_id, "default", "compaction record should use the default tenant");
+    assert_eq!(model, "gpt-4.1", "compaction record should persist the request model");
+
+    let stored_object: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("response_object")).expect("response_object should be valid JSON");
+    assert_eq!(
+        stored_object["object"], "response.compaction",
+        "stored response_object should be a response.compaction"
+    );
+    assert_eq!(
+        stored_object["id"], returned_id,
+        "stored id should match the returned id"
+    );
+    assert_response_usage_contract(&stored_object["usage"]);
+
+    let stored_messages: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("messages")).expect("messages should be valid JSON");
+    let items = stored_messages.as_array().expect("messages should be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "persisted messages should hold the single compaction item"
+    );
+    assert_compaction_item_contract(&items[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_inline_input() {
+    // A contract-conforming `{model, input}` request (no previous_response_id)
+    // must be accepted and compact the inline conversation directly.
+    let backend = Backend::fixed(CHAT_COMPLETIONS_RESPONSE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, "sqlite::memory:", proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","input":[{"role":"user","content":"Explain TCP vs UDP"},{"role":"assistant","content":"TCP is reliable, UDP is not."}]}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "standard {{model, input}} compact request should be accepted"
+    );
+
+    let body = parse_body(&raw);
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
+    assert_eq!(resp["object"], "response.compaction");
+    let output = resp["output"].as_array().expect("output should be an array");
+    assert_eq!(output.len(), 1, "output should have one compaction item");
+    assert_compaction_item_contract(&output[0]);
+    assert_response_usage_contract(&resp["usage"]);
+    drop(proxy);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_unknown_previous_response_id() {
+    // Referencing a response that was never stored must fail before any
+    // summarization callout, with a not-found error. In the recommended
+    // pipeline `rehydrate` runs ahead of compact and rejects the unknown
+    // `previous_response_id` with a 400 "not found", so that is what the
+    // client sees end-to-end (compact's own 404 arm is only reachable when
+    // rehydrate is absent from the chain).
+    let backend = Backend::fixed(CHAT_COMPLETIONS_RESPONSE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, "sqlite::memory:", proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_never_stored"}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "unknown previous_response_id should return 400"
+    );
+    assert!(
+        raw.contains("not found"),
+        "response should explain the id was not found: {raw}"
+    );
+    drop(proxy);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_fail_closed_on_callout_error() {
+    // Phase 1: store a response to reference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_fail_closed");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: the summarization callout fails. The example config uses the
+    // default on_failure=closed, so the request must be rejected with 502.
+    let backend2 = Backend::status(500, r#"{"error":{"message":"backend exploded"}}"#)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+
+    let raw = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "failed callout under fail-closed should return 502"
+    );
+    assert!(
+        raw.contains("summarization callout rejected"),
+        "response should explain the callout was rejected: {raw}"
+    );
+    drop(proxy2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_estimates_usage_when_callout_omits_it() {
+    // Phase 1: store a response to reference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_usage_fallback");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: the callout succeeds but omits `usage`; compaction usage must
+    // fall back to a tiktoken estimate of the conversation and summary.
+    let backend2 = Backend::fixed(CHAT_COMPLETIONS_NO_USAGE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+
+    let raw = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "explicit compact should return 200");
+
+    let resp: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    let usage = &resp["usage"];
+    // Even on the estimated path the emitted usage must satisfy the contract.
+    assert_response_usage_contract(usage);
+    let input_tokens = usage["input_tokens"].as_u64().expect("input_tokens should be a number");
+    let output_tokens = usage["output_tokens"]
+        .as_u64()
+        .expect("output_tokens should be a number");
+    // The stored conversation is large, so the estimate must be non-trivial and
+    // must NOT be the callout values (there were none to thread through).
+    assert!(
+        input_tokens > 100,
+        "estimated input_tokens should reflect the long conversation"
+    );
+    assert!(output_tokens > 0, "estimated output_tokens should reflect the summary");
+    assert_eq!(
+        usage["total_tokens"].as_u64().unwrap(),
+        input_tokens + output_tokens,
+        "total should be the sum of estimated input and output tokens"
+    );
+    drop(proxy2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_reactive_with_store_false_does_not_persist() {
+    // Phase 1: store the first turn.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_store_false");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: a reactive compaction turn with store:false. The callout
+    // summarizes, the compacted request is forwarded to inference, but nothing
+    // from this turn — neither the inference response nor an orphan compaction
+    // row — may be persisted.
+    let (backend_port, _captured) = start_sequenced_backend(CHAT_COMPLETIONS_RESPONSE, INFERENCE_RESPONSE);
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend_port);
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Compare with QUIC","previous_response_id":"resp_compact","context_management":[{"type":"compaction","compact_threshold":1000}],"store":false}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw2), 200, "compaction turn should succeed");
+    drop(proxy2);
+
+    // The database must still contain exactly the first turn's response.
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    let inference_persisted: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses WHERE id = ?")
+        .bind("resp_inf")
+        .fetch_one(&pool)
+        .await
+        .expect("lookup query should run")
+        .get("n");
+    pool.close().await;
+
+    assert_eq!(
+        total, 1,
+        "store:false turn must not add rows (only the first turn persists)"
+    );
+    assert_eq!(
+        inference_persisted, 0,
+        "the store:false inference response must not be persisted"
+    );
 }

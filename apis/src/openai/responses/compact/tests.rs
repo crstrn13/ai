@@ -274,8 +274,20 @@ fn parse_valid_chat_completion_response() {
         }]
     });
     let body = serde_json::to_vec(&response).unwrap();
-    let result = parse_summarization_response(&body);
-    assert_eq!(result.unwrap(), "Here is the summary.");
+    let result = parse_summarization_response(&body).unwrap();
+    assert_eq!(result.content, "Here is the summary.");
+    assert!(result.usage.is_none(), "no usage reported by the callout");
+}
+
+#[test]
+fn parse_response_captures_usage() {
+    let response = json!({
+        "choices": [{"message": {"role": "assistant", "content": "Summary."}}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+    });
+    let body = serde_json::to_vec(&response).unwrap();
+    let result = parse_summarization_response(&body).unwrap();
+    assert_eq!(result.usage.unwrap()["total_tokens"], 60);
 }
 
 #[test]
@@ -296,6 +308,79 @@ fn parse_response_empty_choices_returns_error() {
     let response = json!({"choices": []});
     let body = serde_json::to_vec(&response).unwrap();
     assert!(parse_summarization_response(&body).is_err());
+}
+
+// =============================================================================
+// usage mapping tests
+// =============================================================================
+
+#[test]
+fn map_chat_usage_maps_all_fields() {
+    let usage = json!({
+        "prompt_tokens": 50,
+        "completion_tokens": 10,
+        "total_tokens": 60,
+        "prompt_tokens_details": {"cached_tokens": 8},
+        "completion_tokens_details": {"reasoning_tokens": 4}
+    });
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["input_tokens"], 50);
+    assert_eq!(mapped["output_tokens"], 10);
+    assert_eq!(mapped["total_tokens"], 60);
+    assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 0);
+    assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 4);
+}
+
+#[test]
+fn map_chat_usage_defaults_missing_details_to_zero() {
+    let usage = json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10});
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 0);
+    assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 0);
+}
+
+#[test]
+fn map_chat_usage_derives_total_when_absent() {
+    let usage = json!({"prompt_tokens": 12, "completion_tokens": 5});
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["total_tokens"], 17, "total falls back to input + output");
+}
+
+#[test]
+fn build_compaction_usage_prefers_callout_usage() {
+    let summary = Summarization {
+        content: "short".to_owned(),
+        usage: Some(json!({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})),
+    };
+    let messages = vec![json!({"role": "user", "content": "a much longer conversation body"})];
+    let usage = build_compaction_usage(&messages, Some(&summary), "cl100k_base");
+    // Reported usage wins over any tiktoken estimate of the message/summary text.
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(usage["total_tokens"], 120);
+}
+
+#[test]
+fn build_compaction_usage_falls_back_to_tiktoken_when_usage_absent() {
+    let summary = Summarization {
+        content: "a produced summary".to_owned(),
+        usage: None,
+    };
+    let messages = vec![json!({"role": "user", "content": "the source conversation text"})];
+    let usage = build_compaction_usage(&messages, Some(&summary), "cl100k_base");
+    assert!(
+        usage["input_tokens"].as_u64().unwrap() > 0,
+        "estimates source conversation"
+    );
+    assert!(
+        usage["output_tokens"].as_u64().unwrap() > 0,
+        "estimates produced summary"
+    );
+    assert_eq!(
+        usage["total_tokens"].as_u64().unwrap(),
+        usage["input_tokens"].as_u64().unwrap() + usage["output_tokens"].as_u64().unwrap()
+    );
 }
 
 // =============================================================================
@@ -744,30 +829,49 @@ fn tiktoken_fallback_includes_instructions_and_tools_in_count() {
 // =============================================================================
 
 #[test]
-fn parse_compact_request_body_valid() {
+fn parse_compact_request_body_with_previous_response_id() {
     let body = Some(Bytes::from(
         serde_json::to_vec(&json!({
-            "response_id": "resp_abc",
             "model": "gpt-4o",
+            "previous_response_id": "resp_abc",
             "instructions": "Be concise"
         }))
         .unwrap(),
     ));
     let req = parse_compact_request_body(&body).unwrap();
-    assert_eq!(req.response_id, "resp_abc");
-    assert_eq!(req.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(req.model, "gpt-4o");
+    assert_eq!(req.previous_response_id.as_deref(), Some("resp_abc"));
+    assert!(req.input.is_empty());
     assert_eq!(req.instructions.as_deref(), Some("Be concise"));
 }
 
 #[test]
-fn parse_compact_request_body_minimal() {
+fn parse_compact_request_body_with_string_input() {
     let body = Some(Bytes::from(
-        serde_json::to_vec(&json!({"response_id": "resp_xyz"})).unwrap(),
+        serde_json::to_vec(&json!({"model": "gpt-4o", "input": "Summarize this"})).unwrap(),
     ));
     let req = parse_compact_request_body(&body).unwrap();
-    assert_eq!(req.response_id, "resp_xyz");
-    assert!(req.model.is_none());
-    assert!(req.instructions.is_none());
+    assert_eq!(req.model, "gpt-4o");
+    assert!(req.previous_response_id.is_none());
+    assert_eq!(req.input.len(), 1, "string input coerces to one user message");
+    assert_eq!(req.input[0]["role"], "user");
+    assert_eq!(req.input[0]["content"], "Summarize this");
+}
+
+#[test]
+fn parse_compact_request_body_with_array_input() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"}
+            ]
+        }))
+        .unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.input.len(), 2);
 }
 
 #[test]
@@ -782,67 +886,48 @@ fn parse_compact_request_body_invalid_json() {
 }
 
 #[test]
-fn parse_compact_request_body_missing_response_id() {
-    let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
+fn parse_compact_request_body_missing_model() {
+    // `model` is required by the contract even when content is present.
+    let body = Some(Bytes::from(serde_json::to_vec(&json!({"input": "hello"})).unwrap()));
     assert!(parse_compact_request_body(&body).is_err());
 }
 
 #[test]
-fn parse_compact_request_body_empty_response_id() {
+fn parse_compact_request_body_empty_model() {
     let body = Some(Bytes::from(
-        serde_json::to_vec(&json!({"response_id": "", "model": "gpt-4o"})).unwrap(),
+        serde_json::to_vec(&json!({"model": "", "input": "hello"})).unwrap(),
     ));
     assert!(parse_compact_request_body(&body).is_err());
 }
 
+#[test]
+fn parse_compact_request_body_missing_content() {
+    // `model` alone, with neither `input` nor `previous_response_id`.
+    let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
 // =============================================================================
-// extract_stored_messages
+// stored_message_array
 // =============================================================================
 
 #[test]
-fn extract_stored_messages_returns_messages() {
-    let record = ResponseRecord {
-        id: "resp_1".to_owned(),
-        tenant_id: "default".to_owned(),
-        created_at: 0,
-        model: "gpt-4o".to_owned(),
-        response_object: json!({}),
-        input: json!([]),
-        messages: json!([
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi"}
-        ]),
-    };
-    let msgs = extract_stored_messages(record).unwrap();
-    assert_eq!(msgs.len(), 2);
+fn stored_message_array_returns_messages() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
+    ]);
+    assert_eq!(stored_message_array(messages).len(), 2);
 }
 
 #[test]
-fn extract_stored_messages_empty_array() {
-    let record = ResponseRecord {
-        id: "resp_1".to_owned(),
-        tenant_id: "default".to_owned(),
-        created_at: 0,
-        model: "gpt-4o".to_owned(),
-        response_object: json!({}),
-        input: json!([]),
-        messages: json!([]),
-    };
-    assert!(extract_stored_messages(record).is_err());
+fn stored_message_array_empty_array() {
+    assert!(stored_message_array(json!([])).is_empty());
 }
 
 #[test]
-fn extract_stored_messages_not_array() {
-    let record = ResponseRecord {
-        id: "resp_1".to_owned(),
-        tenant_id: "default".to_owned(),
-        created_at: 0,
-        model: "gpt-4o".to_owned(),
-        response_object: json!({}),
-        input: json!([]),
-        messages: json!("not an array"),
-    };
-    assert!(extract_stored_messages(record).is_err());
+fn stored_message_array_not_array() {
+    assert!(stored_message_array(json!("not an array")).is_empty());
 }
 
 // =============================================================================
