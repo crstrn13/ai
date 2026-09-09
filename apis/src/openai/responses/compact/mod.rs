@@ -16,7 +16,7 @@
 //!
 //! Compaction only applies to **multi-turn requests** where
 //! `openai_responses_rehydrate` has loaded stored conversation history
-//! — i.e. requests that include `previous_response_id` or
+//! - i.e. requests that include `previous_response_id` or
 //! `conversation`. Single-turn requests (no stored history, even with
 //! `context_management` set) are released without compaction because
 //! there is no prior history to summarize.
@@ -116,15 +116,15 @@ struct Summarization {
 ///
 /// Compaction applies in two scenarios:
 ///
-/// - **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored
+/// - **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored
 ///   history is summarized; the current turn is preserved.
 ///
-/// - **Explicit compact** — `POST /v1/responses/compact` with a required `model` and an inline `input` conversation
+/// - **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation
 ///   and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined
 ///   conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
 ///
 /// Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because
-/// `state.input == state.messages` — there is no separable "current turn" to preserve after summarization.
+/// `state.input == state.messages` - there is no separable "current turn" to preserve after summarization.
 /// Requests without rehydrated history are released without compaction.
 ///
 /// Praxis runs `StreamBuffer` body hooks before header-phase request
@@ -437,7 +437,7 @@ fn reject_invalid_compaction_config(ctx: &HttpFilterContext<'_>, streaming: bool
 ///
 /// Returns `true` only when rehydrated history is present. Direct
 /// input requests (no `previous_response_id`) are skipped because
-/// `state.input == state.messages` — there is no separable "current
+/// `state.input == state.messages` - there is no separable "current
 /// turn" to preserve after summarization. Use the explicit
 /// `POST /v1/responses/compact` endpoint for non-rehydrated history.
 ///
@@ -461,7 +461,7 @@ fn is_compactable(state: Option<&ResponsesState>) -> bool {
 /// unknown, or the token count is below the threshold.
 ///
 /// When `previous_usage` is available from the rehydrated response,
-/// its `total_tokens` is used directly — avoiding the cost of BPE
+/// its `total_tokens` is used directly - avoiding the cost of BPE
 /// tokenization. Falls back to tiktoken estimation otherwise. The
 /// fallback estimate includes instructions and tool definitions in
 /// addition to conversation messages, since all three contribute to

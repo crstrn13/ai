@@ -11,11 +11,11 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 Compaction applies in two scenarios:
 
-- **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
+- **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
 
-- **Explicit compact** — `POST /v1/responses/compact` with a required `model` and an inline `input` conversation and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
 
-Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` — there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
+Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` - there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
 
 Praxis runs `StreamBuffer` body hooks before header-phase request filters. This filter therefore requires `allow_pre_security_callout: true` and should only be used behind an outer authentication and authorization boundary.
 
