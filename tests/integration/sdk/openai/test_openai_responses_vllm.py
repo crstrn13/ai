@@ -327,9 +327,18 @@ def _wait_for_proxy(
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    """Streamable HTTP MCP server with a single get_weather tool."""
+    """Streamable HTTP MCP server with deterministic weather/time tools."""
 
     authorization_headers: ClassVar[list[str | None]] = []
+
+    _tool_call_count = 0
+    _tool_call_count_lock = threading.Lock()
+
+    @classmethod
+    def tool_call_count(cls) -> int:
+        """Return the number of tool calls received by this test process."""
+        with cls._tool_call_count_lock:
+            return cls._tool_call_count
 
     def do_POST(self):
         type(self).authorization_headers.append(self.headers.get("Authorization"))
@@ -366,6 +375,16 @@ class MCPHandler(BaseHTTPRequestHandler):
                             },
                         },
                         {
+                            "name": "get_time",
+                            "description": "Get the current local time for a city",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        {
                             "name": "get_weather_map",
                             "description": "Get a weather map image link for a city",
                             "inputSchema": {
@@ -379,6 +398,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                 },
             )
         elif method == "tools/call":
+            with self._tool_call_count_lock:
+                type(self)._tool_call_count += 1
             params = req.get("params", {})
             tool_name = params.get("name")
             city = params.get("arguments", {}).get("city", "unknown")
@@ -402,8 +423,13 @@ class MCPHandler(BaseHTTPRequestHandler):
                     },
                 )
             else:
+                result = (
+                    f"12:00 PM in {city}"
+                    if tool_name == "get_time"
+                    else f"72F and sunny in {city}"
+                )
                 self._json_rpc(
-                    rid, {"content": [{"type": "text", "text": f"72F and sunny in {city}"}]}
+                    rid, {"content": [{"type": "text", "text": result}]}
                 )
         elif method == "ping":
             self._json_rpc(rid, {})
@@ -536,10 +562,12 @@ def _write_agentic_config(
         "- filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
     )
     config = config.replace(
-        "- filter: openai_mcp_dispatch\n              - filter: openai_agentic_loop",
+        "- filter: openai_mcp_dispatch\n"
+        "                max_calls_per_round: 32\n",
         "- filter: openai_mcp_dispatch\n"
         "                allow_loopback: true\n"
-        "              - filter: openai_agentic_loop",
+        "                max_calls_per_round: 32\n",
+        1,
     )
     config = config.replace(
         "max_iterations: 11\n",
@@ -2219,6 +2247,196 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
+    def test_mcp_approval_round_trip_executes_once(
+        self, agentic_client, agentic_proxy,
+    ):
+        """An SDK approval response resumes and executes the MCP call once."""
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+
+        approval = approval_requests[0]
+        assert approval.name == "get_weather"
+        assert approval.server_label == "weather"
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"approved response should contain the MCP result; got: {output_types}"
+        )
+        # The resume must re-enter inference after dispatch; a small model under
+        # /no_think and a 512-token cap may surface only reasoning and no final
+        # message, so accept either as proof the tool result fed back into the model.
+        assert "message" in output_types or "reasoning" in output_types, (
+            f"approved response should resume to model output; got: {output_types}"
+        )
+
+    def test_mcp_approval_resume_streams_without_index_error(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #637 (PR #1029 review): a streamed approval RESUME must
+        announce the locally executed mcp_call at output index 0.
+
+        The approval resume runs *before* the first inference round, so the
+        proxy appends the executed mcp_call at accumulated output index 0 and
+        the resumed model output lands at index 1. If the proxy never emits a
+        ``response.output_item.added`` for index 0, the OpenAI SDK's streaming
+        accumulator never allocates slot 0: the resumed model item is appended
+        as ``output[0]`` and the index-1 model delta then indexes past the end
+        of the list, raising ``IndexError`` mid-stream -- the exact crash this
+        test guards against.
+
+        Turn 1 is buffered to obtain the approval request id; the RESUME turn
+        streams through the SDK's ``responses.stream`` accumulator, which is the
+        surface that raised the regression. Reaching ``get_final_response()``
+        without an exception is itself the primary assertion.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+        approval = approval_requests[0]
+
+        # RESUME turn: stream through the SDK accumulator. Building the final
+        # snapshot from the event sequence is exactly what raised IndexError
+        # before the index-0 mcp_call was announced; letting any such exception
+        # propagate fails the test with the regression's own traceback.
+        added = []  # (output_index, item_type, item_id)
+        text_delta_indices = []
+        with agentic_client.responses.stream(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        ) as stream:
+            for event in stream:
+                if event.type == "response.output_item.added":
+                    item = event.item.model_dump()
+                    added.append(
+                        (event.output_index, item.get("type"), item.get("id"))
+                    )
+                elif event.type == "response.output_text.delta":
+                    text_delta_indices.append(event.output_index)
+            # Replays the accumulated snapshot; raises if any delta referenced
+            # an output index that was never announced with output_item.added.
+            final_response = stream.get_final_response()
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+
+        # The locally executed mcp_call is announced as exactly one incremental
+        # output_item.added at index 0 -- the slot the accumulator needs before
+        # the resumed model output at index 1 can be applied.
+        mcp_added = [a for a in added if a[1] == "mcp_call"]
+        assert len(mcp_added) == 1, (
+            "the resumed mcp_call should surface as exactly one "
+            f"response.output_item.added; got: {added}"
+        )
+        mcp_index = mcp_added[0][0]
+        assert mcp_index == 0, (
+            "the resumed mcp_call executes before the first inference round, so "
+            f"it must be announced at output index 0; got index {mcp_index}"
+        )
+
+        # Any resumed model text streams at an output index after the index-0
+        # mcp_call -- the ordering the accumulator relies on. (Empty is fine: a
+        # small model under /no_think + a 512-token cap may emit only reasoning.)
+        assert all(idx > mcp_index for idx in text_delta_indices), (
+            "resumed model text must stream at an output index after the "
+            f"index-0 mcp_call; mcp_index={mcp_index}, deltas={text_delta_indices}"
+        )
+
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"resumed response should contain the MCP result; got: {output_types}"
+        )
+
     def test_mcp_tool_auto_executes_and_returns(
         self,
         agentic_client,
@@ -2359,7 +2577,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2398,7 +2618,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2432,7 +2654,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2502,6 +2726,43 @@ class TestAgenticLoopVLLM:
                 "agentic loop can dispatch it"
             )
         assert len(BraveSearchHandler.request_paths) == request_count + 1
+
+    def test_batched_mcp_tools_honor_parallel_tool_calls(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Two MCP calls emitted in one model round both complete."""
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris "
+                "in the same turn before answering. Do not omit either "
+                "function. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "utilities",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather", "get_time"],
+                    "require_approval": "never",
+                }
+            ],
+            parallel_tool_calls=True,
+            store=False,
+            max_output_tokens=512,
+        )
+
+        mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+        assert len(mcp_calls) == 2, (
+            "both calls from the batched model round must execute exactly "
+            f"once; got: {[item.type for item in response.output]}"
+        )
+        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
 
     def test_mcp_tool_streams_terminal_round_as_one_logical_response(
         self,
@@ -3658,6 +3919,225 @@ class TestFileSearchChatCompletionsVLLM:
         assert marker in payload, (
             "OGX search results (via include=file_search_call.results) should "
             f"contain the indexed marker {marker!r}; got: {payload}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Streaming hosted file search (issue #313)
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/file-search-streaming.yaml"
+)
+
+
+def _write_file_search_streaming_config(praxis_port: int) -> str:
+    """Patch the shipped file-search-streaming example for testing.
+
+    Exercises the real #313 streaming example config (per repo test
+    requirements) while retargeting the vector-store callout at OGX and the
+    model backend at vLLM's native /v1/responses endpoint. The shipped
+    example ships tight deadlines suited to a fast provider; CPU-only vLLM
+    under co-located CI load (postgres + vLLM + OGX) needs the wider budgets
+    already used by the agentic and non-streaming file-search fixtures.
+    """
+    with open(FILE_SEARCH_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+    # Retarget the model backend and give it a generous read timeout, matching
+    # _write_agentic_config. This is also the only occurrence of :3001.
+    config = config.replace(
+        '- "127.0.0.1:3001"',
+        f'- "{_vllm_endpoint()}"\n'
+        "                    read_timeout_ms: 300000",
+    )
+    # Widen the IRR and callout deadlines for slow CPU inference/search.
+    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
+    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
+    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_streaming_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search-streaming")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search streaming proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_client(file_search_streaming_proxy):
+    """Return an OpenAI client pointed at the streaming file-search proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+def _drain_response_stream(stream):
+    """Consume a Responses SSE stream.
+
+    Returns the ordered event types, every output item announced via
+    output_item.added/.done, and the terminal response status.
+    """
+    event_types = []
+    output_items = []
+    terminal_status = None
+    for event in stream:
+        event_types.append(event.type)
+        if event.type in (
+            "response.output_item.added",
+            "response.output_item.done",
+        ):
+            output_items.append(event.item)
+        if event.type in ("response.completed", "response.incomplete"):
+            terminal_status = event.response.status
+    return event_types, output_items, terminal_status
+
+
+class TestFileSearchStreamingVLLM:
+    """Issue #313: streaming hosted file_search (stream=True).
+
+    Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
+    example config: openai_stream_events(logical_stream) + file_search_callout
+    + openai_responses_proxy (streaming transport auto-derived from
+    stream=True). vLLM emits a private
+    function_call(name=file_search), which the callout suppresses and replaces
+    with a synthesized file_search_call lifecycle, runs the OGX search, and
+    streams a terminal re-inference round -- all collapsed onto a single
+    client-visible SSE response envelope.
+    """
+
+    _INPUT = (
+        "Use the file_search tool to find information about the Praxis "
+        "marker. Repeat the marker exactly. /no_think"
+    )
+
+    def test_streaming_file_search_lifecycle_events(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The hosted file_search lifecycle is synthesized onto the stream."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, terminal_status = _drain_response_stream(
+            stream
+        )
+
+        assert event_types, "stream should yield at least one event"
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] in (
+            "response.completed",
+            "response.incomplete",
+        ), event_types
+        assert terminal_status in ("completed", "incomplete"), terminal_status
+
+        assert "response.file_search_call.completed" in event_types, (
+            "streaming hosted file_search must emit the completed lifecycle "
+            f"event; got: {event_types}"
+        )
+
+        file_search_items = [
+            item for item in output_items if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "a hosted file_search_call item must be announced on the stream; "
+            f"got event types: {event_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("searching", "completed", "incomplete"), (
+                "file_search_call status should be a known lifecycle state; "
+                f"got: {item.status}"
+            )
+
+    def test_streaming_file_search_single_logical_stream(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The search round and terminal round collapse into one envelope."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, _status = _drain_response_stream(stream)
+
+        # The #756/#313 logical stream unifies the search round and the
+        # terminal re-inference round into ONE client-visible envelope.
+        assert event_types.count("response.created") == 1, (
+            "multiple model rounds must collapse to a single response.created; "
+            f"got: {event_types}"
+        )
+        terminal_count = sum(
+            1
+            for t in event_types
+            if t in ("response.completed", "response.incomplete")
+        )
+        assert terminal_count == 1, (
+            "the logical stream must emit exactly one terminal response event; "
+            f"got: {event_types}"
+        )
+
+        # The private function used to drive the search must never surface to
+        # the client as a function_call.
+        leaked = [
+            item for item in output_items if item.type == "function_call"
+        ]
+        assert not leaked, (
+            "the hosted file_search must not leak as a client function_call; "
+            f"leaked: {[getattr(item, 'name', '?') for item in leaked]}"
         )
 
 

@@ -58,6 +58,12 @@ before sending requests.
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
 
+### Azure
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
+
 ### Inference
 
 | File | Description |
@@ -80,6 +86,7 @@ before sending requests.
 | [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates the `openai_file_search_callout` filter configuration |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
 | [file-search-chat-completions.yaml](configs/openai/responses/file-search-chat-completions.yaml) | Accepts finite OpenAI Responses requests with hosted file search while targeting a backend that only implements /v1/chat/completions |
+| [file-search-streaming.yaml](configs/openai/responses/file-search-streaming.yaml) | Demonstrates streaming hosted file_search through the iterative_request_router |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Extends the full-flow pipeline with an iterative_request_router (IRR) around the inference step, enabling server-side file search execution |
 | [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, and backend routing into a single pipeline |
