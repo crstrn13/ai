@@ -738,6 +738,7 @@ impl CompactionWriter<'_> {
             "id": resp_id,
             "object": "response.compaction",
             "created_at": created_at,
+            "status": "completed",
             "output": output,
             "usage": usage,
         });

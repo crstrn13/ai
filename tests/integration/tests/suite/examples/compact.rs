@@ -711,6 +711,81 @@ async fn compact_explicit_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
+    // Regression: the compaction response must be usable as a
+    // `previous_response_id`. `rehydrate::validate_response_status` rejects any
+    // stored record whose `status` is not "completed" (missing status reads as
+    // 'unknown'), so the compaction object must persist `status: "completed"`.
+    // Otherwise the id we hand back cannot actually be continued from, breaking
+    // the follow-up continuity the endpoint advertises.
+
+    // Phase 1: store a response via normal inference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_follow_up");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: explicitly compact the stored response and capture the returned id.
+    let backend2 = Backend::fixed(CHAT_COMPLETIONS_RESPONSE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw2), 200, "explicit compact should return 200");
+    let compaction: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw2)).expect("response should be valid JSON");
+    assert_eq!(
+        compaction["status"], "completed",
+        "compaction response must carry status 'completed' to be a valid follow-up target"
+    );
+    let compaction_id = compaction["id"]
+        .as_str()
+        .expect("compaction response should have an id")
+        .to_owned();
+    drop(backend2);
+    drop(proxy2);
+
+    // Phase 3: send a follow-up request referencing the compaction id. Rehydrate
+    // must accept the record (status == "completed") and continue from it. Before
+    // the status fix this failed with 400 "cannot continue from response with
+    // status 'unknown'".
+    let backend3 = Backend::fixed(INFERENCE_RESPONSE)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config3 = load_compact_config(&yaml, db.url(), proxy_port, backend3.port());
+    let proxy3 = start_proxy(&config3);
+    let follow_up =
+        format!(r#"{{"model":"gpt-4.1","input":"Compare with QUIC","previous_response_id":"{compaction_id}"}}"#);
+    let raw3 = http_send(proxy3.addr(), &json_post("/v1/responses", &follow_up));
+    assert_eq!(
+        parse_status(&raw3),
+        200,
+        "follow-up referencing the compaction id should rehydrate and succeed, body: {raw3}"
+    );
+    drop(proxy3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_inline_input() {
     // A contract-conforming `{model, input}` request (no previous_response_id)
     // must be accepted and compact the inline conversation directly.
