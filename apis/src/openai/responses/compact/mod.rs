@@ -14,12 +14,20 @@
 //!
 //! # Scope
 //!
-//! Compaction only applies to **multi-turn requests** where
-//! `openai_responses_rehydrate` has loaded stored conversation history,
-//! i.e. requests that include `previous_response_id` or
-//! `conversation`. Single-turn requests (no stored history, even with
-//! `context_management` set) are released without compaction because
-//! there is no prior history to summarize.
+//! Compaction applies in two scenarios:
+//!
+//! - **Reactive** — multi-turn requests where
+//!   `openai_responses_rehydrate` has loaded stored conversation
+//!   history, i.e. requests that include `previous_response_id` or
+//!   `conversation`. Single-turn requests (no stored history, even
+//!   with `context_management` set) are released without compaction
+//!   because there is no prior history to summarize.
+//! - **Explicit** — `POST /v1/responses/compact`, which summarizes any
+//!   previously stored response (plus optional inline `input`)
+//!   regardless of rehydration, returning a `response.compaction`
+//!   object.
+//!
+//! See [`CompactFilter`] for the full description of both scenarios.
 //!
 //! Praxis runs `StreamBuffer` body hooks before header-phase request
 //! filters. Configuration therefore requires an explicit
