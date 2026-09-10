@@ -331,9 +331,20 @@ impl CompactFilter {
         let req = parse_compact_request_body(body)?;
         let (store, tenant_id) = resolve_store_and_tenant(ctx)?;
         let messages = collect_compact_messages(&*store, &tenant_id, &req).await?;
-        let summary = self.summarize_messages(&req, &messages).await?;
-        let response_object =
-            build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &messages, summary.as_ref()).await?;
+        let writer = CompactionWriter {
+            filter: self,
+            ctx,
+            store: &*store,
+            tenant_id: &tenant_id,
+            req: &req,
+            messages: &messages,
+        };
+        let response_object = if let Some(summary) = self.summarize_messages(&req, &messages).await? {
+            writer.persist_compacted(&summary).await?
+        } else {
+            warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
+            writer.persist_uncompacted().await?
+        };
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
@@ -664,63 +675,88 @@ fn stored_message_array(messages: Value) -> Vec<Value> {
     }
 }
 
-/// Build and persist the compaction result for an explicit compact request.
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "all parameters are needed to build and persist the record"
-)]
-async fn build_and_persist_compaction(
-    filter: &CompactFilter,
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn crate::store::ResponseStore,
-    tenant_id: &str,
-    req: &ExplicitCompactRequest,
-    messages: &[Value],
-    summary: Option<&Summarization>,
-) -> Result<Value, FilterAction> {
-    let resp_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
-    let created_at = i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
+/// Borrows everything needed to build and persist an explicit compaction
+/// result, so the persist paths read as methods rather than long argument lists.
+struct CompactionWriter<'a> {
+    /// Filter config (summary prefix, tiktoken encoding).
+    filter: &'a CompactFilter,
+    /// Request context, used for id and timestamp generation.
+    ctx: &'a HttpFilterContext<'a>,
+    /// Response store the compaction record is persisted to.
+    store: &'a dyn crate::store::ResponseStore,
+    /// Tenant the record is scoped to.
+    tenant_id: &'a str,
+    /// The parsed explicit compact request (supplies the response model).
+    req: &'a ExplicitCompactRequest,
+    /// The conversation being compacted.
+    messages: &'a [Value],
+}
 
-    let output = match summary {
-        Some(summary) => {
-            let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
-            Value::Array(vec![build_compaction_item(
-                &compaction_id,
-                &summary.content,
-                &filter.config.summary_prefix,
-            )])
-        },
-        // Fail-open pass-through: the summarization callout failed but
-        // `on_failure: open` is configured, so instead of erroring we return the
-        // conversation uncompacted. `usage.output_tokens` is 0 because no summary
-        // was produced (see `build_compaction_usage`); the caller can detect the
-        // no-op by the absence of a `compaction` item in `output`.
-        None => Value::Array(messages.to_vec()),
-    };
-    let usage = build_compaction_usage(messages, summary, &filter.config.tiktoken_encoding);
-    let response_object = serde_json::json!({
-        "id": resp_id,
-        "object": "response.compaction",
-        "created_at": created_at,
-        "output": output,
-        "usage": usage,
-    });
+impl CompactionWriter<'_> {
+    /// Persist the compaction result for a successful summarization. The
+    /// response `output` and the persisted history are the same single
+    /// compaction item.
+    async fn persist_compacted(&self, summary: &Summarization) -> Result<Value, FilterAction> {
+        let compaction_id = format!("compact_{}", self.ctx.id_generator.generate(self.ctx.time_source));
+        let item = Value::Array(vec![build_compaction_item(
+            &compaction_id,
+            &summary.content,
+            &self.filter.config.summary_prefix,
+        )]);
+        let usage = build_compaction_usage(self.messages, Some(summary), &self.filter.config.tiktoken_encoding);
+        self.persist_response(item.clone(), item, usage).await
+    }
 
-    let record = ResponseRecord {
-        id: resp_id,
-        tenant_id: tenant_id.to_owned(),
-        created_at,
-        model: req.model.clone(),
-        response_object: response_object.clone(),
-        input: output.clone(),
-        messages: output,
-    };
-    store.upsert_response(&record).await.map_err(|e| {
-        warn!(error = %e, "failed to persist explicit compaction response");
-        reject_compact(500, "server_error", "failed to persist compaction response")
-    })?;
-    Ok(response_object)
+    /// Persist an uncompacted no-op when the summarization callout fails under
+    /// `on_failure: open`.
+    ///
+    /// The response `output` is an empty array: there is no summary, so no
+    /// `compaction` item is emitted, and its absence is the caller's no-op
+    /// signal. Returning the raw `{role, content}` messages instead would
+    /// violate the Responses output schema (items require `type`/`id`/`status`).
+    /// The intact conversation is still persisted as the record's history so a
+    /// follow-up request referencing this response id rehydrates it in full.
+    async fn persist_uncompacted(&self) -> Result<Value, FilterAction> {
+        let usage = build_compaction_usage(self.messages, None, &self.filter.config.tiktoken_encoding);
+        self.persist_response(Value::Array(Vec::new()), Value::Array(self.messages.to_vec()), usage)
+            .await
+    }
+
+    /// Assemble the `response.compaction` object, persist the record, and return
+    /// the object. `output` is the API-facing output array; `stored_messages` is
+    /// the history persisted for rehydration continuity (the two differ on
+    /// fail-open).
+    async fn persist_response(
+        &self,
+        output: Value,
+        stored_messages: Value,
+        usage: Value,
+    ) -> Result<Value, FilterAction> {
+        let resp_id = format!("resp_{}", self.ctx.id_generator.generate(self.ctx.time_source));
+        let created_at = i64::try_from(self.ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
+        let response_object = serde_json::json!({
+            "id": resp_id,
+            "object": "response.compaction",
+            "created_at": created_at,
+            "output": output,
+            "usage": usage,
+        });
+
+        let record = ResponseRecord {
+            id: resp_id,
+            tenant_id: self.tenant_id.to_owned(),
+            created_at,
+            model: self.req.model.clone(),
+            response_object: response_object.clone(),
+            input: stored_messages.clone(),
+            messages: stored_messages,
+        };
+        self.store.upsert_response(&record).await.map_err(|e| {
+            warn!(error = %e, "failed to persist explicit compaction response");
+            reject_compact(500, "server_error", "failed to persist compaction response")
+        })?;
+        Ok(response_object)
+    }
 }
 
 /// Build a `ResponseUsage` object for the compaction pass.

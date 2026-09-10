@@ -832,6 +832,102 @@ async fn compact_explicit_endpoint_fail_closed_on_callout_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_fail_open_returns_schema_valid_empty_output() {
+    // Phase 1: store a response to reference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_fail_open");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    // Opt the compact filter into fail-open so a failed callout yields a no-op
+    // compaction response rather than a 502.
+    let yaml = yaml.replace(
+        "        default_model: llama3.2:1b\n",
+        "        default_model: llama3.2:1b\n        on_failure: open\n",
+    );
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: the summarization callout fails. Under on_failure=open the
+    // endpoint must return a schema-valid response.compaction with an EMPTY
+    // output array (no compaction item = the no-op signal), never the raw
+    // `{role, content}` messages, which would lack the required output-item
+    // fields and break typed OpenAI clients.
+    let backend2 = Backend::status(500, r#"{"error":{"message":"backend exploded"}}"#)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+
+    let raw = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "failed callout under fail-open should return 200: {raw}"
+    );
+
+    let body = parse_body(&raw);
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
+    assert_eq!(
+        resp["object"], "response.compaction",
+        "fail-open response should still be a response.compaction object"
+    );
+    let output = resp["output"].as_array().expect("output should be an array");
+    assert!(
+        output.is_empty(),
+        "fail-open output must be empty (no compaction item), got: {output:?}"
+    );
+    // No summary was produced, so no output tokens were generated.
+    assert_response_usage_contract(&resp["usage"]);
+    assert_eq!(
+        resp["usage"]["output_tokens"], 0,
+        "fail-open usage.output_tokens must be 0 (no summary produced)"
+    );
+    drop(proxy2);
+
+    // The intact conversation must still be persisted so a follow-up request
+    // using this response id rehydrates the full history rather than nothing.
+    let returned_id = resp["id"].as_str().expect("response id should be a string");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let row = sqlx::query("SELECT messages FROM openai_responses WHERE id = ?")
+        .bind(returned_id)
+        .fetch_one(&pool)
+        .await
+        .expect("compaction record should be persisted");
+    pool.close().await;
+
+    let stored_messages: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("messages")).expect("messages should be valid JSON");
+    let items = stored_messages.as_array().expect("messages should be an array");
+    assert!(
+        !items.is_empty(),
+        "fail-open must persist the intact conversation, not an empty history"
+    );
+    assert!(
+        items.iter().all(|m| m["type"] != "compaction"),
+        "fail-open persisted history must not contain a compaction item: {items:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_estimates_usage_when_callout_omits_it() {
     // Phase 1: store a response to reference.
     let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
