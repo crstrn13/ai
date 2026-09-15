@@ -502,12 +502,17 @@ impl IntelligentRouteFilter {
     ///
     /// Returns `Some(Continue)` when the request path matches a configured
     /// `skip_paths` prefix, setting `ctx.cluster` to `management_cluster` when
-    /// one is configured. Returns `None` for non-management paths, which
-    /// continue to model resolution.
+    /// one is configured. A cluster already chosen by an earlier filter is
+    /// preserved (never overwritten), matching the non-management path. Returns
+    /// `None` for non-management paths, which continue to model resolution.
     fn try_management_skip(&self, ctx: &mut HttpFilterContext<'_>) -> Option<FilterAction> {
         let path = ctx.rewritten_path.as_deref().unwrap_or_else(|| ctx.request.uri.path());
         if !path_is_management(path, &self.skip_paths) {
             return None;
+        }
+        if ctx.cluster.is_some() {
+            tracing::debug!(path = %path, "intelligent_route: management path but cluster already set; preserving");
+            return Some(FilterAction::Continue);
         }
         if let Some(cluster) = &self.management_cluster {
             ctx.cluster = Some(Arc::clone(cluster));
@@ -1430,6 +1435,28 @@ mod tests {
             cluster.as_deref(),
             Some("inf"),
             "inference path must resolve to the model's cluster, not the management cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_cluster_preserves_cluster_set_by_earlier_filter() {
+        // A cluster chosen by a filter before intelligent_route wins even on a
+        // management path: try_management_skip must not overwrite it, matching
+        // the non-management preserve path. See praxis-proxy/ai#1180 review.
+        let f = parse(
+            "local_site: site-a\nmanagement_cluster: management-api\nskip_paths:\n  - /v1/models\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n",
+        )
+        .unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/v1/models");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("pre-set-cluster"));
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("pre-set-cluster"),
+            "management skip must not overwrite a cluster set by an earlier filter"
         );
     }
 

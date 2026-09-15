@@ -161,7 +161,9 @@ pub fn parse_dedicated_promotion_header(
     name: &str,
     dedicated: &[&str],
 ) -> Result<HeaderName, FilterError> {
-    validate_header_name(filter, field, Some(name))?;
+    if name.is_empty() {
+        return Err(format!("{filter}: {field} header name must not be empty").into());
+    }
     let header = name.parse::<HeaderName>().map_err(|e| -> FilterError {
         format!("{filter}: {field} header name is not a valid HTTP header name: {e}").into()
     })?;
