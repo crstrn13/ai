@@ -16,6 +16,7 @@ mod aws_sigv4;
 mod azure_ad;
 mod azure_translation;
 mod compact;
+mod credential_inject_parity;
 mod credential_injection;
 mod external_metering;
 mod file_search_callout;
