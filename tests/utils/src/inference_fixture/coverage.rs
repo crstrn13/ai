@@ -1232,9 +1232,14 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
+                vec!["messages_native_passthrough"],
+                vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
@@ -1247,11 +1252,20 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_client_tool_compat"],
+                vec!["responses_client_tool_compat"],
+                vec!["responses_client_tool_compat", "responses_to_chat_completions"],
+                vec!["responses_client_tool_compat", "responses_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1265,58 +1279,87 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
-                CoverageStatus::LiveCovered,
-                CoverageStatus::LiveCovered,
-                CoverageStatus::LiveCovered,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
-                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 27);
-        assert_eq!(report.scenarios_total, 27);
-        assert_eq!(report.recordings_total, 32);
+        assert_eq!(report.features_total, 41);
+        assert_eq!(report.scenarios_total, 42);
+        assert_eq!(report.recordings_total, 47);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
                 "messages/basic-nonstream",
                 "messages/basic-stream",
+                "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
                 "messages/native-basic-nonstream",
                 "messages/native-basic-stream",
+                "messages/native-count-tokens",
                 "messages/native-tool-use",
+                "messages/provider-parameter-passthrough",
+                "messages/stop-sequence-nonstream",
+                "messages/stop-sequence-stream",
                 "messages/typed-server-tools",
+                "messages/unrepresentable-parameters",
                 "messages/upstream-error",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
+                "responses/background-unsupported",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
+                "responses/chat-null-tool-choice",
+                "responses/chat-reasoning-disabled",
+                "responses/chat-reasoning-nonstream",
+                "responses/chat-reasoning-replay",
+                "responses/chat-structured-output-with-tools",
                 "responses/chat-tool-echo",
                 "responses/chat-unrepresentable-parameters",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
                 "responses/client-tool-compat",
+                "responses/client-tool-compat-chat",
+                "responses/client-tool-compat-chat-stream",
+                "responses/client-tool-compat-stream",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1325,7 +1368,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 27);
+        assert_eq!(manifest.features.len(), 41);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1357,6 +1400,10 @@ mod tests {
                     &vec!["messages/malformed-tool-arguments".to_owned()]
                 ),
                 (
+                    &"messages.response.invalid_tool_id".to_owned(),
+                    &vec!["messages/invalid-tool-id".to_owned()]
+                ),
+                (
                     &"messages.streaming.usage".to_owned(),
                     &vec!["messages/basic-stream".to_owned()]
                 ),
@@ -1367,6 +1414,14 @@ mod tests {
                 (
                     &"messages.error.malformed_success".to_owned(),
                     &vec!["messages/malformed-success".to_owned()]
+                ),
+                (
+                    &"messages.request.provider_parameter_passthrough".to_owned(),
+                    &vec!["messages/provider-parameter-passthrough".to_owned()]
+                ),
+                (
+                    &"messages.request.unrepresentable_parameters".to_owned(),
+                    &vec!["messages/unrepresentable-parameters".to_owned()]
                 ),
                 (
                     &"messages.native.request".to_owned(),
@@ -1388,6 +1443,10 @@ mod tests {
                     &vec!["messages/native-tool-use".to_owned()]
                 ),
                 (
+                    &"messages.native.count_tokens".to_owned(),
+                    &vec!["messages/native-count-tokens".to_owned()]
+                ),
+                (
                     &"responses.native.request".to_owned(),
                     &vec![
                         "responses/native-basic-nonstream".to_owned(),
@@ -1405,6 +1464,10 @@ mod tests {
                 (
                     &"responses.native.tool_call".to_owned(),
                     &vec!["responses/native-tool-call".to_owned()]
+                ),
+                (
+                    &"responses.request.background_unsupported".to_owned(),
+                    &vec!["responses/background-unsupported".to_owned()]
                 ),
                 (
                     &"responses.native.continuation".to_owned(),
@@ -1459,6 +1522,14 @@ mod tests {
                     &vec!["responses/chat-basic-nonstream".to_owned()]
                 ),
                 (
+                    &"responses.chat.reasoning.request".to_owned(),
+                    &vec!["responses/chat-reasoning-nonstream".to_owned()]
+                ),
+                (
+                    &"responses.chat.reasoning.response".to_owned(),
+                    &vec!["responses/chat-reasoning-nonstream".to_owned()]
+                ),
+                (
                     &"responses.chat.malformed_compaction".to_owned(),
                     &vec!["responses/chat-malformed-compaction".to_owned()]
                 ),
@@ -1471,8 +1542,42 @@ mod tests {
                     &vec!["responses/chat-tool-echo".to_owned()]
                 ),
                 (
+                    &"responses.chat.null_tool_choice".to_owned(),
+                    &vec!["responses/chat-null-tool-choice".to_owned()]
+                ),
+                (
+                    &"responses.chat.reasoning.replay".to_owned(),
+                    &vec![
+                        "responses/chat-reasoning-replay".to_owned(),
+                        "responses/chat-reasoning-disabled".to_owned(),
+                    ]
+                ),
+                (
+                    &"responses.chat.structured_output_with_tools".to_owned(),
+                    &vec!["responses/chat-structured-output-with-tools".to_owned()]
+                ),
+                (
                     &"responses.client_tool_compat.lower_restore".to_owned(),
                     &vec!["responses/client-tool-compat".to_owned()]
+                ),
+                (
+                    &"responses.client_tool_compat.stream_restore".to_owned(),
+                    &vec!["responses/client-tool-compat-stream".to_owned()]
+                ),
+                (
+                    &"responses.client_tool_compat.chat_lower_restore".to_owned(),
+                    &vec!["responses/client-tool-compat-chat".to_owned()]
+                ),
+                (
+                    &"responses.client_tool_compat.chat_stream_restore".to_owned(),
+                    &vec!["responses/client-tool-compat-chat-stream".to_owned()]
+                ),
+                (
+                    &"messages.response.stop_sequence".to_owned(),
+                    &vec![
+                        "messages/stop-sequence-nonstream".to_owned(),
+                        "messages/stop-sequence-stream".to_owned(),
+                    ]
                 ),
             ]
         );
@@ -1506,7 +1611,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[3..4] {
+        for feature in &manifest.features[3..5] {
             assert_eq!(
                 feature
                     .providers
@@ -1517,7 +1622,7 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[4]
+            manifest.features[5]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
@@ -1527,7 +1632,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[5..7] {
+        for feature in &manifest.features[6..10] {
             assert_eq!(
                 feature
                     .providers
@@ -1537,7 +1642,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[7..10] {
+        for feature in &manifest.features[10..13] {
             assert_eq!(
                 feature
                     .providers
@@ -1547,7 +1652,15 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[10..13] {
+        assert_eq!(
+            manifest.features[13]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)]
+        );
+        for feature in &manifest.features[14..17] {
             assert_eq!(
                 feature
                     .providers
@@ -1560,7 +1673,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..] {
+        for feature in &manifest.features[17..28] {
             assert_eq!(
                 feature
                     .providers
@@ -1570,6 +1683,34 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
+        for feature in &manifest.features[28..30] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("vllm", CoverageStatus::LiveCovered)]
+            );
+        }
+        for feature in &manifest.features[30..40] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
+        assert_eq!(
+            manifest.features[40]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("vllm", CoverageStatus::LiveCovered)]
+        );
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
         }));

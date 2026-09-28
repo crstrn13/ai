@@ -5,17 +5,22 @@
 
 Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 
+## Configuration Notes
+
+Each provider request is executed through the shared filtered-subrequest executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally. An optional `outbound_chain` runs operator-managed cross-cutting filters on the callout; when omitted it defaults to an empty inline chain (pure passthrough), so the central protections still apply.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
+| `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily, which authenticates via the request body. |
 | `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
-| `timeout_ms` | integer | no | Callout timeout in milliseconds. |
+| `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
 | `base_url` | string | no | Override the provider's default API base URL. |
-| `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
+| `outbound_chain` | string \| object | no | Outbound filter chain the provider callout executes through. A **named** reference resolves against the top-level `filter_chains` map, so it binds only when the filter is placed at the top level of a pipeline (see the `web-search.yaml` example). An **inline** definition embeds the filters directly and always binds — including when the filter runs nested as a step of an `iterative_request_router` (the agentic loop), where the step pipeline's chain map is empty and a named reference cannot resolve. Use an inline chain for any nested/IRR placement; a named reference is available only where top-level `filter_chains` are in scope. The chain carries cross-cutting concerns (observability, security, credential injection) and is bound once at pipeline-build time — a chain that cannot be built fails config validation. Destination authority, DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the executor, gated by `insecure_options.allow_private_upstreams`. Optional. The provider callout always runs through the shared executor; this chain only adds filters along the way. When omitted it defaults to an empty inline chain (pure passthrough) via [`default_outbound_chain`], so every central protection still applies. Provide it only to attach cross-cutting concerns. |
 | `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search` does not accept it. |
 
 ## Examples
@@ -34,6 +39,7 @@ api_key: ${WEB_SEARCH_API_KEY}
 filter: anthropic_web_search
 provider: you
 api_key: ${WEB_SEARCH_API_KEY}
+outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000
 max_body_bytes: 67108864

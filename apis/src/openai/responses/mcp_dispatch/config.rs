@@ -3,6 +3,7 @@
 
 //! Configuration for the `openai_mcp_dispatch` filter.
 
+use praxis_core::config::ChainRef;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -40,9 +41,31 @@ pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpDispatchConfig {
-    /// Allow connections to loopback addresses (default: false).
+    /// Optional per-user bearer slot from `callout_credentials`. Must match the
+    /// corresponding `openai_mcp_tool_resolve` setting.
     #[serde(default)]
-    pub allow_loopback: bool,
+    pub user_credential: Option<String>,
+
+    /// Optional opaque assertion slot from `callout_credentials.assertions`. Must match
+    /// the corresponding `openai_mcp_tool_resolve` setting.
+    #[serde(default)]
+    pub authorization_assertion: Option<String>,
+
+    /// Inline outbound filter chain the MCP `tools/call` callout runs through.
+    ///
+    /// `openai_mcp_dispatch` runs inside an `iterative_request_router` step. praxis
+    /// core builds each IRR step with a live chain-binding context, so an inline
+    /// chain (`{ name, filters }`) is bound at step-build time. A named reference is
+    /// rejected: IRR supplies each step an empty top-level named-chain map, so a
+    /// `Named` reference can never resolve inside a step (see
+    /// [`require_inline_outbound_chain`]). The chain carries only
+    /// operator-configured cross-cutting filters — the SSRF-validated dial target is
+    /// staged by the transport, so no upstream-selecting filter is prepended. When
+    /// omitted, the callout runs through an empty chain and dials the staged target
+    /// directly. Whether loopback/private MCP destinations are permitted is governed
+    /// by the operator's global insecure posture, not a per-filter flag.
+    #[serde(default)]
+    pub outbound_chain: Option<ChainRef>,
 
     /// Trusted request headers forwarded to connector-backed MCP `tools/call` requests.
     /// No request headers are forwarded by default. Credential headers such as
@@ -52,7 +75,9 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
-    /// Per-call timeout in milliseconds for `tools/call` calls.
+    /// Per-call timeout in milliseconds for `tools/call` calls. Inside an
+    /// iterative request router, every MCP exchange is capped by the router's
+    /// remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
@@ -106,6 +131,8 @@ fn default_max_total_result_bytes() -> usize {
 pub(crate) fn build_config(mut cfg: McpDispatchConfig) -> Result<McpDispatchConfig, FilterError> {
     crate::openai::api_client::validate_forward_headers("openai_mcp_dispatch", &mut cfg.forward_headers)?;
     reject_mcp_sensitive_forward_headers("openai_mcp_dispatch", &cfg.forward_headers)?;
+    validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
+    validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
     if cfg.timeout_ms == 0 {
         return Err("openai_mcp_dispatch: timeout_ms must be greater than 0".into());
     }
@@ -151,6 +178,42 @@ pub(crate) fn build_config(mut cfg: McpDispatchConfig) -> Result<McpDispatchConf
         );
     }
     Ok(cfg)
+}
+
+/// Validate one optional request-scoped context slot name.
+fn validate_context_slot(field: &str, slot: Option<&str>) -> Result<(), FilterError> {
+    if let Some(slot) = slot
+        && (slot.is_empty() || slot.len() > 128)
+    {
+        return Err(format!("openai_mcp_dispatch: {field} must be 1..=128 bytes").into());
+    }
+    Ok(())
+}
+
+/// Reject a `Named` outbound-chain reference, requiring an inline chain.
+///
+/// `openai_mcp_dispatch` runs nested inside an `iterative_request_router` step,
+/// and IRR builds each step's pipeline with an empty top-level named-chain map.
+/// A `Named` reference (`outbound_chain: my-chain`) therefore can never resolve
+/// inside a step and would fail pipeline construction with a confusing "unknown
+/// chain" error. Require the chain inline instead
+/// (`outbound_chain: { name: ..., filters: [...] }`), which embeds its filters
+/// directly and needs no lookup. Propagating outer named chains into IRR steps
+/// is a praxis-core follow-up.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when `outbound_chain` is a [`ChainRef::Named`].
+pub(crate) fn require_inline_outbound_chain(outbound_chain: Option<&ChainRef>) -> Result<(), FilterError> {
+    if let Some(ChainRef::Named(name)) = outbound_chain {
+        return Err(format!(
+            "openai_mcp_dispatch: outbound_chain must be defined inline \
+             ({{ name, filters }}); a named reference ('{name}') cannot resolve \
+             inside the iterative_request_router step this filter runs in"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Reject ambient credentials and protocol-controlled fields at MCP's

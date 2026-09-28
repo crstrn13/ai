@@ -83,8 +83,10 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
     boot_server(config, registry, subrequest_client, config_path)
 }
 
-/// Common server startup: enforce checks, build pipelines, register
-/// protocols, spawn the config watcher, and run.
+/// Common server startup: install the crypto provider (a no-op when the entry
+/// point already did, but tracing is up now, so this is where its status gets
+/// logged), enforce checks, build pipelines, register protocols, spawn the
+/// config watcher, and run.
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
 fn boot_server(
@@ -93,6 +95,12 @@ fn boot_server(
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     config_path: Option<PathBuf>,
 ) -> ! {
+    install_crypto_provider();
+    if praxis_tls::provider::required()
+        && let Some(reason) = fips_blocker(&registry)
+    {
+        fatal(&reason);
+    }
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
@@ -438,6 +446,83 @@ fn spawn_health_check_tasks(
 // Utility Functions
 // -----------------------------------------------------------------------------
 
+/// Registered filter names whose dependencies do their own cryptography
+/// outside the system OpenSSL, so a binary that registers one cannot honor
+/// `PRAXIS_REQUIRE_FIPS` whatever the provider reports.
+///
+/// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
+///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
+/// - `openai_response_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2`
+///   (and, with `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools)
+///   implies `store`, so this one name covers them all.
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+
+/// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
+///
+/// The provider and kernel checks cover rustls only; a filter on
+/// `NON_FIPS_FILTERS` carries its own cryptography. Checked against the
+/// registry rather than the config so a hot reload cannot add the filter
+/// later.
+#[must_use]
+pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
+    let available = registry.available_filters();
+    let registered: Vec<String> = NON_FIPS_FILTERS
+        .iter()
+        .copied()
+        .filter(|name| available.contains(name))
+        .map(|name| format!("`{name}` filter"))
+        .collect();
+
+    (!registered.is_empty()).then(|| {
+        format!(
+            "{} is set but this binary registers the {}, whose dependencies do their own cryptography outside the \
+             system OpenSSL; run the FIPS build",
+            praxis_tls::provider::REQUIRE_FIPS_ENV,
+            registered.join(" and ")
+        )
+    })
+}
+
+/// Install the process-wide rustls crypto provider, the one backed by the
+/// system OpenSSL, and log the FIPS status it reports.
+///
+/// Call it before anything that might build a TLS configuration, including
+/// `--validate` and `--dump`. With `PRAXIS_REQUIRE_FIPS` set the process
+/// refuses to start unless FIPS mode is in effect (the provider reports
+/// FIPS-approved algorithms and the kernel flag is on), naming each missing
+/// signal. It is a check, never a switch: FIPS mode comes from the host, and
+/// praxis-ai never enables a provider on its own.
+pub fn install_crypto_provider() {
+    praxis_tls::provider::install();
+
+    if !praxis_tls::provider::installed() {
+        fatal(&format!(
+            "failed to install the {} crypto provider; refusing to start",
+            praxis_tls::provider::name()
+        ));
+    }
+
+    let status = praxis_tls::provider::status();
+    info!(
+        provider = status.name,
+        provider_fips = status.provider_fips,
+        kernel_fips = ?status.kernel_fips,
+        fips_required = praxis_tls::provider::required(),
+        "installed rustls crypto provider"
+    );
+
+    if praxis_tls::provider::required() {
+        let unmet = status.unmet();
+        if !unmet.is_empty() {
+            fatal(&format!(
+                "{} is set but FIPS mode is not in effect: {}",
+                praxis_tls::provider::REQUIRE_FIPS_ENV,
+                unmet.join("; ")
+            ));
+        }
+    }
+}
+
 /// Print a fatal error to stderr and exit the process.
 #[expect(
     clippy::print_stderr,
@@ -522,6 +607,44 @@ mod tests {
         let path = super::resolve_config_path(None);
         if !std::path::Path::new("praxis.yaml").exists() {
             assert!(path.is_none(), "should return None when praxis.yaml does not exist");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Crypto provider
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn install_crypto_provider_installs_the_system_openssl_provider() {
+        super::install_crypto_provider();
+        let status = praxis_tls::provider::status();
+        assert!(status.installed, "a process-wide provider is installed");
+        assert_eq!(
+            status.name, "openssl",
+            "the only compiled-in provider is the OpenSSL one"
+        );
+        super::install_crypto_provider();
+        assert!(praxis_tls::provider::installed(), "installing again is harmless");
+    }
+
+    #[test]
+    fn the_fips_blocker_names_exactly_the_registered_non_fips_filters() {
+        praxis_tls::provider::install();
+        let client =
+            praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None));
+        let registry = crate::build_full_registry(&client);
+        let blocker = super::fips_blocker(&registry);
+        if cfg!(any(feature = "policy-engine", feature = "store")) {
+            let reason = blocker.expect("a binary with non-FIPS filters is blocked");
+            assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
+            if cfg!(feature = "policy-engine") {
+                assert!(reason.contains("`policy` filter"), "{reason}");
+            }
+            if cfg!(feature = "store") {
+                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            }
+        } else {
+            assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
         }
     }
 }

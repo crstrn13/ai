@@ -5,6 +5,7 @@ members = [
     "server/build_support",
     "filters",
     "apis",
+    "benchmarks",
     "integrations/llmd/ext-proc",
     "xtask",
     "tests/environment",
@@ -14,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
@@ -24,13 +25,15 @@ repository = "https://github.com/praxis-proxy/ai"
 [workspace.dependencies]
 async-trait = "0.1.92"
 aws-credential-types = "1.3.0"
-aws-sigv4 = "1.5.1"
+aws-sigv4 = "1.5.3"
 base64 = "0.23.1"
 bytes = "1.12.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 dashmap = "6.2.1"
+# zlib-ng backend: the same one already in the graph, so it adds no crate.
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-ng"] }
 futures = "0.3.34"
 h2 = "0.4.19"
 http = "1.5.0"
@@ -41,14 +44,28 @@ jsonschema = { version = "0.56.0", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
+object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
+# System OpenSSL bindings, the same crate praxis's rustls provider uses; never
+# with the `vendored` feature, the platform library is the validated module.
+openssl = "0.10.81"
 quote = "1.0.47"
-rand = "0.10.2"
-rcgen = "0.14.9"
-redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
+rand = "0.10.3"
+rcgen = "0.14.10"
+redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
-rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
-rustls = "0.23.45"
+# TLS through rustls without a compiled-in provider: reqwest's `rustls`
+# feature would compile aws-lc-rs into every consumer, a second cryptography
+# stack next to the system OpenSSL the process provider routes through. With
+# `rustls-no-provider` reqwest uses the provider the process installed
+# (praxis_tls::provider::install), so the FIPS suites' test binaries carry no
+# alternative provider a green run could have silently used. rmcp forwards
+# the same choice to its own reqwest edge.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+# Without default features: `aws_lc_rs` on by default would silently link
+# aws-lc-rs into every test binary, and `prefer-post-quantum` implies
+# `aws_lc_rs`. The provider is whatever the process installed.
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
@@ -57,16 +74,19 @@ serde_json_canonicalizer = "0.3.2"
 serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 serde_json_path = "0.7.2"
 sha2 = "0.11.0"
-syn = { version = "3.0.4", features = ["full", "extra-traits", "visit"] }
+sse-stream = "0.2.6"
+syn = { version = "3.0.6", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio"] }
-sse-stream = "0.2.5"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tiktoken-rs = "0.12.0"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
-tokio-rustls = "0.26.4"
+# Without its default `aws_lc_rs` feature, which would compile a second
+# crypto provider into every test binary; the harness installs the
+# OpenSSL-backed provider before building any TLS config.
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.19"
 url = "2.5.8"
@@ -75,6 +95,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 utoipa = "5.5.0"
 wiremock = "0.6.5"
 allocation-counter = "0.8.1"
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
@@ -86,29 +107,35 @@ tonic-prost = "0.14.6"
 tonic-prost-build = { version = "0.14.6", features = ["transport"] }
 tokio-stream = "0.1.19"
 zeroize = "1.9.0"
+zstd = "0.14.0"
 
-# Praxis core dependencies
-# Pin to git until cap_stream_deadline ships on crates.io (praxis-proxy/praxis#1179).
-praxis-core = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-core" }
-praxis-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-filter" }
-praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-protocol" }
-praxis-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-tls" }
-praxis = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy" }
+# Praxis core dependencies. The filter and server crates are taken without
+# their default features, which would turn on the `policy` filter (the Praxis
+# Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
+# forwards that engine through its own `policy-engine` feature instead, on by
+# default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
+praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.1", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.1", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.3.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.4.1", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.3.0", path = "server", default-features = false }
-praxis-ai-filters = { version = "0.3.0", path = "filters", default-features = false }
-praxis-ai-apis = { version = "0.3.0", path = "apis", default-features = false }
-praxis-ai-build-support = { version = "0.3.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.4.1", path = "server", default-features = false }
+praxis-ai-filters = { version = "0.4.1", path = "filters", default-features = false }
+praxis-ai-apis = { version = "0.4.1", path = "apis", default-features = false }
+praxis-ai-build-support = { version = "0.4.1", path = "server/build_support" }
 
-# Pingora (temporary fork)
-pingora-core = { version = "0.9.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
-pingora-http = { version = "0.9.0", package = "quixotic-plecostomus-http" }
-pingora-proxy = { version = "0.9.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
+# Pingora (temporary fork), at the version praxis builds against; two versions
+# of the fork in one graph do not share types, and the older one carries its
+# own rustls provider.
+pingora-core = { version = "0.10.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
+pingora-http = { version = "0.10.0", package = "quixotic-plecostomus-http" }
+pingora-proxy = { version = "0.10.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 arc-swap = "1.9.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }

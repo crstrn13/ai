@@ -345,6 +345,17 @@ fn round_trip_captures_tool_and_model_requests() {
             .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
         "ambient identity must not cross the request-selected MCP URL boundary"
     );
+    // The example's openai_mcp_dispatch binds an inline outbound_chain whose
+    // `headers` filter stamps X-MCP-Client. tools/call is issued only by dispatch
+    // (tool_resolve issues initialize/tools/list), so its presence here proves the
+    // dispatch outbound_chain is bound and runs on the callout inside the IRR step.
+    assert!(
+        call.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-mcp-client") && value == "praxis-ai-gateway"),
+        "the dispatch outbound_chain must stamp X-MCP-Client on the tools/call callout: {:?}",
+        call.headers
+    );
     let call_body: serde_json::Value = serde_json::from_str(&call.body).expect("tools/call body should be JSON");
     assert_eq!(call_body["params"]["arguments"]["location"], "SF");
 
@@ -2209,6 +2220,23 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         "model backend should receive exactly three requests"
     );
 
+    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
+    // they share one initialized session. The server therefore sees a single
+    // dispatch handshake covering both tools/call rounds; the only other
+    // initialize/tools/list pair comes from tool discovery
+    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
+    // would re-handshake, yielding initialize == 3.
+    assert_eq!(
+        mcp.method_count("initialize"),
+        2,
+        "one discovery handshake + one reused dispatch handshake across both rounds"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        1,
+        "tool discovery lists the server once"
+    );
+
     // Both tools executed exactly once.
     assert_eq!(mcp.method_count("tools/call"), 2, "exactly two MCP tool calls total");
     assert_eq!(
@@ -3330,6 +3358,77 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     );
 }
 
+/// #958: the web-search provider callout is dispatched through the filtered
+/// subrequest executor, so the filters configured in the web-search filter's
+/// `outbound_chain` run on the outbound request. The example's outbound chain
+/// contains a `request_id` filter, which injects an `X-Request-ID` header — its
+/// presence on the provider callout is observable proof the outbound chain
+/// executed (rather than the callout bypassing the configured chain).
+#[test]
+fn web_search_callout_executes_outbound_chain_filters() {
+    let first_response = serde_json::json!({
+        "id": "resp_ws_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Rust 2025 brings great features."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let captured = spawn_capturing_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+    assert_eq!(parse_status(&raw), 200, "web search round-trip should return 200");
+
+    // Copy the captured requests out and release the lock before asserting.
+    let requests = captured.lock().expect("capture lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "provider should be hit exactly once, got: {requests:?}"
+    );
+    let head = requests[0].to_ascii_lowercase();
+    assert!(
+        head.contains("x-request-id:"),
+        "the outbound_chain's request_id filter must inject X-Request-ID on the provider callout, \
+         proving the configured outbound chain executed: {}",
+        requests[0]
+    );
+}
+
 /// #1046 boundary test 3: a single model round emitting a `web_search_call`, a
 /// hosted `file_search_call`, and an MCP `function_call` is resolved by all three
 /// request-phase dispatchers in ONE IRR continuation — the model is called
@@ -4040,6 +4139,155 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
 }
 
 #[test]
+fn streaming_web_search_multi_query_call_costs_one_tool_call() {
+    // Streaming counterpart of the buffered multi-query round trip: the model
+    // announces one web_search_call carrying three queries while the client caps
+    // built-in tool calls at one. `max_tool_calls` counts logical tool calls, so
+    // the call is admitted whole, fans out to three provider requests, and the
+    // synthesized lifecycle still resolves into a single logical response.
+    let queries = serde_json::json!(["Rust 2025 edition", "Rust async runtime", "Rust release notes"]);
+    let search_call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_stream_multi",
+        "status": "completed",
+        "action": {"type": "search", "queries": queries}
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_multi_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_ws_multi_1",
+                "output_index": 0,
+                "item": search_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_multi_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [search_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let final_message = serde_json::json!({
+        "type": "message",
+        "id": "msg_ws_multi_2",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Rust search completed."}]
+    });
+    let second_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_multi_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_ws_multi_2",
+                "item_id": "msg_ws_multi_2",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Rust search completed.",
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_multi_2",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [final_message],
+                    "usage": {"input_tokens": 15, "output_tokens": 4, "total_tokens": 19}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_calls = spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model_port, search_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust news",
+        "stream": true,
+        "store": false,
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed multi-query web search should return 200: {raw}"
+    );
+
+    let frames = assert_logical_stream_conformance(&body, "resp_ws_multi_1");
+    // Panics unless exactly one added frame carries a web_search_call: the
+    // fan-out stays one logical tool item rather than one item per query.
+    let ws_added = item_frame(&frames, "response.output_item.added", "web_search_call");
+    assert_eq!(
+        ws_added.data["item"]["action"]["queries"], queries,
+        "the announced tool item keeps every requested query: {body}"
+    );
+
+    let output = terminal_output(&frames);
+    assert_eq!(output[0]["type"], "web_search_call", "terminal[0] type: {body}");
+    assert_eq!(
+        output[0]["status"], "completed",
+        "a fully dispatched multi-query call is completed, not clipped by max_tool_calls: 1: {body}"
+    );
+    assert_eq!(
+        output[0]["action"]["queries"], queries,
+        "the streamed action preserves every requested query: {body}"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    assert_eq!(
+        search_calls.load(Ordering::SeqCst),
+        3,
+        "every query of the single admitted call reaches the provider"
+    );
+    let rounds = model_requests
+        .lock()
+        .expect("model request lock should not be poisoned")
+        .len();
+    assert_eq!(
+        rounds, 2,
+        "the call cost one tool-call unit, so the loop resumes with its results"
+    );
+}
+
+#[test]
 fn streaming_web_search_suppresses_premature_round_zero_done() {
     // #276 (finding): the model announces a web_search_call AND emits its
     // output_item.done in round 0 without ever streaming the tool's progress
@@ -4684,6 +4932,45 @@ fn spawn_search_mock(listener: TcpListener) -> Arc<AtomicUsize> {
     connections
 }
 
+/// Serve web-search results and capture the raw request line + headers of every
+/// provider callout.
+///
+/// The returned buffer lets a test prove that the filters configured in the
+/// web-search filter's `outbound_chain` actually ran on the provider callout:
+/// the `request_id` filter injects an `X-Request-ID` header, so its presence in
+/// the captured request is observable evidence the outbound chain executed.
+fn spawn_capturing_search_mock(listener: TcpListener) -> Arc<Mutex<Vec<String>>> {
+    use std::io::{Read as _, Write as _};
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust 2025 Edition",
+                "url": "https://blog.rust-lang.org/2025",
+                "description": "The Rust 2025 edition is here."
+            }]
+        }
+    })
+    .to_string();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            // Capture the request head (request line + headers) so the test can
+            // assert the injected outbound-chain header is present.
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            sink.lock().expect("capture lock").push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    captured
+}
+
 /// Vector-store mock for hosted file search: serves every connection with a
 /// fixed `{"data": [...]}` result set and counts dispatched requests so a test
 /// can assert exactly how many vector-store callouts the file-search dispatcher
@@ -4849,6 +5136,105 @@ fn web_search_caps_multiple_calls_within_one_round_without_reentry() {
         model.requests().len(),
         1,
         "budget exhaustion must not trigger a post-search continuation"
+    );
+}
+
+#[test]
+fn web_search_multi_query_call_costs_one_tool_call() {
+    // The model asks for three queries inside a *single* web_search_call while
+    // the client caps built-in tool calls at one. `max_tool_calls` counts
+    // logical tool calls, so the call is admitted in full: three provider
+    // requests are dispatched, the call completes, and no call is rejected.
+    let first_response = serde_json::json!({
+        "id": "resp_ws_multi_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_multi_a",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "queries": ["Rust 2025 edition", "Rust async runtime", "Rust release notes"]
+            }
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_ws_multi_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_ws_multi",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Rust 2025 edition shipped.", "annotations": []}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust news",
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "multi-query round-trip should return 200");
+
+    assert_eq!(
+        search_count.load(Ordering::SeqCst),
+        3,
+        "every query of the single admitted call reaches the provider"
+    );
+
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let executed = output
+        .iter()
+        .find(|item| item["type"] == "web_search_call")
+        .expect("the web_search_call must be retained in the final output");
+    assert_eq!(
+        executed["status"], "completed",
+        "a fully dispatched multi-query call is completed"
+    );
+    assert_eq!(
+        executed["action"]["queries"],
+        serde_json::json!(["Rust 2025 edition", "Rust async runtime", "Rust release notes"]),
+        "the client-visible action preserves every requested query"
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|item| item["type"] == "web_search_call" && item["status"] == "failed"),
+        "one multi-query call must not exhaust max_tool_calls: 1"
+    );
+
+    // The single call cost one unit, so the loop continued into a normal
+    // post-search model round rather than terminating on budget exhaustion.
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the admitted call must re-enter the model with its results"
     );
 }
 
@@ -5384,10 +5770,11 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
 }
 
@@ -5413,26 +5800,31 @@ fn load_unified_dispatch_config(
     // Point the brave web-search provider at the local search mock.
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     let yaml = yaml.replacen(
         "      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n",
-        "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
+        "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: project_state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
         1,
     );
-    // Allow loopback MCP resolution and dispatch against the in-test MCP server.
+    // Retarget MCP resolution and dispatch at the in-test loopback MCP server.
+    // Loopback is permitted through the example config's
+    // `insecure_options.allow_private_upstreams` (propagated to each callout's
+    // outbound pipeline), not a per-filter opt-in, so no `allow_loopback` field
+    // is injected.
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
         &format!(
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
         ),
         1,
     );
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
-        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
+        "              - filter: project_state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")
@@ -6815,25 +7207,15 @@ fn load_loopback_mcp_config_inner(
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     let yaml = if forward_headers {
         yaml.replacen(
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n",
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
             1,
         )
         .replacen(
-            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
+            "              - filter: openai_mcp_dispatch\n",
+            "              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
             1,
         )
     } else {
@@ -6866,17 +7248,12 @@ fn load_loopback_mcp_config_with_connectors(
         .collect();
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
-        &format!("      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        connectors:\n{connector_yaml}"),
+        &format!("      - filter: openai_mcp_tool_resolve\n        connectors:\n{connector_yaml}"),
         1,
     );
     assert!(
         connectors.iter().all(|(id, _)| yaml.contains(&format!("id: {id}"))),
         "expected to rewrite example connector config for {connectors:?}"
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP connector config")
 }
@@ -6891,16 +7268,6 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"
     );
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config without rehydration")
 }
 
@@ -6912,16 +7279,6 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
@@ -6934,16 +7291,6 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(

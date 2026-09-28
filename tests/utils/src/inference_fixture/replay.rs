@@ -111,7 +111,7 @@ impl ScenarioRunner {
         let mut proxy = start_proxy(&config);
         backend.finish_proxy_readiness();
 
-        let client = reqwest::Client::builder()
+        let client = crate::inference_fixture::http_client_builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -425,6 +425,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_responses_proxy"
             | "path_rewrite"
             | "openai_responses_format"
+            | "openai_responses_request"
             | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
@@ -1711,6 +1712,7 @@ mod tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    #[cfg(feature = "store")]
     use praxis_ai_apis::openai::ResponseStoreFilter;
     use praxis_core::config::Config;
     use serde_json::{Value, json};
@@ -1797,6 +1799,10 @@ mod tests {
         );
     }
 
+    // Materializes through the Responses proxy, whose pipeline builds the
+    // sqlite-backed response store, so it needs the store-sqlite backend
+    // compiled in (run via `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[tokio::test]
     async fn materialize_records_uncontacted_upstream_when_translation_rejects() {
         let scenario = malformed_compaction_scenario();
@@ -2351,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn replay_transport_error_never_exposes_request_query() {
         let port = free_port_guard().release();
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let request = RecordedRequest {
             method: "GET".to_owned(),
             path: "/?credential=transport-secret-never-log".to_owned(),
@@ -2604,6 +2610,12 @@ mod tests {
         }
     }
 
+    // Asserts the live ResponseStore API accepts scheme-less sqlite paths, so it
+    // needs the store-sqlite backend compiled in (run via
+    // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
+    #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_scheme_less_sqlite_paths() {
         let source = replay_config_source("openai/responses/response-store.yaml");
@@ -3183,6 +3195,8 @@ mod tests {
         assert_eq!(error.to_string(), "scenario outbound URL is not loopback");
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[test]
     fn replay_config_rejects_all_response_store_postgres_targets() {
         let cases = [
@@ -3273,6 +3287,12 @@ mod tests {
         }
     }
 
+    // Asserts the live ResponseStore API accepts empty/temporary sqlite targets,
+    // so it needs the store-sqlite backend compiled in (run via
+    // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
+    #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_empty_sqlite_temporary_databases() {
         for database_url in ["sqlite:", "sqlite://", "sqlite:?", "sqlite://?"] {
@@ -3319,7 +3339,7 @@ mod tests {
 
     #[tokio::test]
     async fn scenario_request_path_rejects_non_origin_forms_before_networking() {
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
         let invalid_paths = [
             "https://example.test/v1/messages",
@@ -3373,7 +3393,7 @@ mod tests {
             ),
         ] {
             let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
-            let client = reqwest::Client::new();
+            let client = crate::inference_fixture::http_client();
             let mut scenario = scenario_with_turns(vec![
                 scenario_turn("first", "must not reach the wire", false),
                 scenario_turn("invalid", "must fail during preflight", false),
@@ -3429,7 +3449,7 @@ mod tests {
             body: RecordedBody::Empty,
         }])
         .expect("loopback capture server should start");
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let path = "/v1/messages?mode=a%2Fb&author=O%27Reilly&dot=%2E&empty=";
         let request = RecordedRequest {
             method: "GET".to_owned(),
@@ -3582,6 +3602,8 @@ mod tests {
         std::fs::read_to_string(example_config_path(relative)).expect("example config should load")
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     fn response_store_filter_accepts_database_url(backend: &str, database_url: &str, allow_private: bool) {
         let database_url = serde_json::to_string(database_url).expect("database URL should serialize");
         let private_option = if allow_private {

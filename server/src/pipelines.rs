@@ -33,6 +33,8 @@ pub fn resolve_pipelines(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
+    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
+
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
@@ -84,11 +86,12 @@ fn configure_pipeline(
     if !kv_stores.is_empty() {
         pipeline.set_kv_stores(kv_stores.clone());
     }
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    crate::install_pipeline_extensions(pipeline);
     pipeline.set_subrequest_client(subrequest_client.clone());
     // Propagate the private-upstream override into the pipeline and its nested
-    // callout chains (e.g. `openai_file_resolve`'s outbound chain) so their
-    // runtime SSRF checks read the configured value on every (re)build.
+    // callout chains (e.g. `openai_file_resolve`'s and the MCP callouts'
+    // outbound chains) so their runtime SSRF checks read the configured value on
+    // every (re)build.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
     Ok(())
@@ -236,7 +239,14 @@ fn validate_unconditional_closed(
 
 /// Run pipeline ordering validation; either fail or warn depending
 /// on insecure option flags.
-#[expect(clippy::cognitive_complexity, reason = "pre-existing complexity above threshold")]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tracing feature sets"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "pre-existing complexity above threshold; tracing macro expansion varies with enabled features"
+)]
 fn validate_pipeline(
     pipeline: &FilterPipeline,
     entries: &[FilterEntry],
@@ -454,6 +464,7 @@ insecure_options:
         );
     }
 
+    #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
     #[test]
     fn resolve_pipelines_transport_limit_governs_openai_responses_raw_body() {
         // Every OpenAI Responses body filter declares a 64 MiB StreamBuffer
@@ -898,8 +909,11 @@ filter_chains:
         praxis_core::kv::KvStoreRegistry::new()
     }
 
-    /// Minimal sub-request client for tests.
+    /// Minimal sub-request client for tests. The connector builds a rustls
+    /// config, which needs the process-wide crypto provider first (the binary
+    /// installs it at startup; a no-op after the first call).
     fn test_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 

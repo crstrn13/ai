@@ -1,22 +1,22 @@
 # Responses API Request Validation
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Validates Responses API JSON and enriches request metadata.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-responses
 #
-# The openai_responses_format classifier must run before openai_responses_validate.
-# It buffers the body, classifies the request as Responses API, and
-# promotes model/stream/store/background to openai_responses_format.*
-# metadata that openai_responses_validate copies into responses.* metadata.
+# openai_responses_request recognizes the Responses create operation from
+# the request head, then deserializes the body exactly once. That single
+# parse produces every downstream fact: it buffers the body, classifies the
+# request as Responses API, promotes model/stream/store/background to
+# openai_responses_format.* metadata, extracts conversation.id when present,
+# generates response and conversation IDs, and writes responses.* metadata
+# for downstream pipeline filters.
 #
-# openai_responses_validate then extracts conversation.id when present,
-# generates response and conversation IDs, and writes responses.*
-# metadata for downstream pipeline filters.
-#
-# Valid JSON requests are forwarded to the upstream backend with the
-# original body unchanged. Invalid JSON requests receive a 400 error
-# response. Provider-supported parameter combinations are not rejected.
+# Valid supported JSON requests are forwarded to the upstream backend with
+# the original body unchanged. Invalid JSON and unsupported background-mode
+# requests receive a 400 error response.
 #
 # Example valid request:
 #
@@ -24,18 +24,12 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
 #
-# Example background streaming request (forwarded to a capable backend):
+# Example unsupported background request (rejected before the backend):
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'
 #
-# Example background request without durable storage:
-#
-#   curl -X POST http://localhost:8080/v1/responses \
-#     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"test","background":true,"store":false}'
-
 listeners:
   - name: responses-gateway
     address: "127.0.0.1:8080"
@@ -45,9 +39,8 @@ listeners:
 filter_chains:
   - name: validate-and-route
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: reject
-      - filter: openai_responses_validate
       - filter: router
         routes:
           - path: "/v1/responses"

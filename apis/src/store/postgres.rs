@@ -14,11 +14,13 @@ use tracing::info;
 
 use super::{
     SslMode,
+    compression::{StoreCompressionConfig, decode, run_blocking},
     pool::{PoolConfig, apply_pool_config},
+    postgres_tls::PgTlsConfig,
     schemas::{
-        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
-        expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding, schema_version_table,
-        validate_postgres_identifiers,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
+        check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
+        schema_version_table, validate_postgres_identifiers,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
@@ -51,6 +53,8 @@ pub struct PostgresResponseStore {
     pool: sqlx::PgPool,
     /// Configured table names.
     tables: TableNames,
+    /// Payload compression codec applied on write.
+    compression: StoreCompressionConfig,
 }
 
 impl PostgresResponseStore {
@@ -66,12 +70,20 @@ impl PostgresResponseStore {
     /// `items_table`, when provided, enables the conversation items
     /// table for storing individual conversation entries.
     ///
-    /// `ssl_mode` always overrides any `sslmode` in the URL —
-    /// explicitly when provided, or with the [`SslMode::VerifyFull`]
-    /// default when omitted. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
-    /// with `ssl_root_cert` to verify the server against a custom
-    /// CA. Certificate path existence is validated at connection
-    /// time, not at construction.
+    /// `tls` carries the TLS mode and certificate paths. `ssl_mode`
+    /// always overrides any `sslmode` in the URL — explicitly when
+    /// provided, or with the [`SslMode::VerifyFull`] default when
+    /// omitted. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
+    /// with `ssl_root_cert` to verify the server against a custom CA,
+    /// and `ssl_client_cert`/`ssl_client_key` for mutual TLS.
+    /// Certificate path existence is validated at connection time, not
+    /// at construction. See [`PgTlsConfig`] for the certificate-
+    /// authentication compliance profile.
+    ///
+    /// `compression` selects the optional codec applied to the
+    /// responses table's payload columns on write; when omitted, those
+    /// payloads are stored as raw JSON bytes. Reads auto-detect the
+    /// format, so records written under any setting remain readable.
     ///
     /// # Errors
     ///
@@ -79,26 +91,30 @@ impl PostgresResponseStore {
     /// initialization, or table name validation fails.
     #[expect(
         clippy::too_many_arguments,
-        reason = "constructor mirrors SqliteResponseStore::new with SSL and pool additions"
+        clippy::too_many_lines,
+        reason = "distinct connection, table-name, TLS, pool, and compression inputs are clearer passed explicitly than bundled"
     )]
     pub async fn new(
         database_url: &str,
         responses_table: &str,
         conversations_table: &str,
         items_table: Option<&str>,
-        ssl_mode: Option<SslMode>,
-        ssl_root_cert: Option<&str>,
+        tls: &PgTlsConfig<'_>,
         pool_config: Option<&PoolConfig>,
+        compression: Option<&StoreCompressionConfig>,
     ) -> Result<Self, StoreError> {
+        if let Some(compression) = compression {
+            compression.validate().map_err(StoreError::InvalidInput)?;
+        }
         let tables = TableNames {
             responses: responses_table.to_owned(),
             conversations: conversations_table.to_owned(),
             items: items_table.map(str::to_owned),
         };
         validate_postgres_identifiers(&tables)?;
-        let ddl = generate_ddl(&tables)?;
+        let ddl = generate_ddl(&tables, SqlDialect::Postgres)?;
 
-        let options = pg_connect_options(database_url, ssl_mode, ssl_root_cert)?;
+        let options = pg_connect_options(database_url, tls)?;
         let pool = Box::pin(apply_pool_config(PgPoolOptions::new(), pool_config).connect_with(options))
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -118,7 +134,11 @@ impl PostgresResponseStore {
             conversations = conversations_table,
             "postgres response store initialized"
         );
-        Ok(Self { pool, tables })
+        Ok(Self {
+            pool,
+            tables,
+            compression: compression.cloned().unwrap_or_default(),
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -199,28 +219,76 @@ impl PostgresResponseStore {
     }
 }
 
-/// Build `PostgreSQL` connection options from URL and optional TLS overrides.
+/// Build `PostgreSQL` connection options from a URL and TLS settings.
 ///
 /// Always applies an SSL mode: the explicit override when provided,
 /// otherwise [`SslMode::VerifyFull`]. This overrides any `sslmode`
-/// embedded in the URL to ensure TLS-verified connections by default.
-fn pg_connect_options(
-    database_url: &str,
-    ssl_mode: Option<SslMode>,
-    ssl_root_cert: Option<&str>,
-) -> Result<PgConnectOptions, StoreError> {
-    let mut options: PgConnectOptions = database_url
+/// embedded in the URL to ensure TLS-verified connections by default,
+/// and applies the configured root CA and client certificate/key.
+///
+/// When [`PgTlsConfig::require_certificate_authentication`] is set, the
+/// options are rebuilt from a password-file-free base so a stray
+/// `~/.pgpass` entry cannot inject a password that would drive
+/// application-side (`RustCrypto`) SCRAM/MD5 cryptography. Filter
+/// validation has already rejected any password embedded in the URL and
+/// the `PGPASSWORD` environment variable, so the effective password is
+/// `None`.
+fn pg_connect_options(database_url: &str, tls: &PgTlsConfig<'_>) -> Result<PgConnectOptions, StoreError> {
+    let parsed: PgConnectOptions = database_url
         .parse()
         .map_err(|e: sqlx::Error| StoreError::Database(e.to_string()))?;
 
-    let effective_mode = ssl_mode.unwrap_or_default();
+    let mut options = if tls.require_certificate_authentication {
+        rebuild_without_password_file(&parsed)
+    } else {
+        parsed
+    };
+
+    let effective_mode = tls.ssl_mode.unwrap_or_default();
     options = options.ssl_mode(PgSslMode::from(effective_mode));
 
-    if let Some(cert_path) = ssl_root_cert {
+    if let Some(cert_path) = tls.ssl_root_cert {
         options = options.ssl_root_cert(Path::new(cert_path));
+    }
+    if let Some(cert_path) = tls.ssl_client_cert {
+        options = options.ssl_client_cert(Path::new(cert_path));
+    }
+    if let Some(key_path) = tls.ssl_client_key {
+        options = options.ssl_client_key(Path::new(key_path));
     }
 
     Ok(options)
+}
+
+/// Rebuild connection options from a password-file-free base.
+///
+/// Copies only the addressing fields (host, port, socket, username,
+/// database) from `parsed` onto [`PgConnectOptions::new_without_pgpass`],
+/// which never reads `~/.pgpass`. TLS fields are applied by the caller.
+/// The resulting password is `None` (the `PGPASSWORD` environment
+/// variable is rejected by the compliance-profile validation before this
+/// runs), so no password reaches the connection.
+///
+/// Copying only addressing fields is lossless here because compliance-profile
+/// validation runs first and fails closed on any other URL connection parameter
+/// (`application_name`, `options`/`options[...]`, `statement-cache-capacity`) —
+/// see `postgres_url_dropped_connection_param`. `SQLx` exposes no getter for the
+/// statement-cache capacity and `get_options` cannot round-trip through the
+/// key/value `options` setter, so those parameters cannot be carried faithfully;
+/// rejecting them upstream keeps this rebuild from silently dropping settings
+/// such as `search_path` that would otherwise redirect store DDL and queries.
+fn rebuild_without_password_file(parsed: &PgConnectOptions) -> PgConnectOptions {
+    let mut rebuilt = PgConnectOptions::new_without_pgpass()
+        .host(parsed.get_host())
+        .port(parsed.get_port())
+        .username(parsed.get_username());
+    if let Some(database) = parsed.get_database() {
+        rebuilt = rebuilt.database(database);
+    }
+    if let Some(socket) = parsed.get_socket() {
+        rebuilt = rebuilt.socket(socket);
+    }
+    rebuilt
 }
 
 /// Fetch column names for a `PostgreSQL` table from `information_schema`.
@@ -461,15 +529,8 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
 
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "owner-preserving SQL upsert keeps all bindings explicit"
-    )]
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let [response_object, input, messages] = self.compression.encode(record).await?;
 
         let sql = format!(
             "INSERT INTO {} \
@@ -521,7 +582,10 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        row.map(|r| row_to_response_record(&r)).transpose()
+        match row {
+            Some(row) => run_blocking(move || row_to_response_record(&row)).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
@@ -634,10 +698,7 @@ impl ResponseStore for PostgresResponseStore {
             return self.upsert_response(record).await;
         }
 
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let [response_object, input, messages] = self.compression.encode(record).await?;
 
         let upsert_sql = format!(
             "INSERT INTO {} \
@@ -1435,11 +1496,11 @@ fn row_to_pending_approval_record(row: &PgRow) -> Result<PendingApprovalRecord, 
 
 /// Convert a sqlx row to a [`ResponseRecord`].
 fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
-    let response_object_json: String = row
+    let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
-    let input_json: String = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
-    let messages_json: String = row
+    let input_json: Vec<u8> = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
+    let messages_json: Vec<u8> = row
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -1450,10 +1511,9 @@ fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
         model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
-        response_object: serde_json::from_str(&response_object_json)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?,
-        input: serde_json::from_str(&input_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
-        messages: serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        response_object: decode(&response_object_json)?,
+        input: decode(&input_json)?,
+        messages: decode(&messages_json)?,
     })
 }
 
@@ -1530,7 +1590,7 @@ mod tests {
 
     #[test]
     fn connect_options_defaults_to_verify_full() {
-        let options = pg_connect_options("postgres://user:pass@example.com/db", None, None)
+        let options = pg_connect_options("postgres://user:pass@example.com/db", &PgTlsConfig::default())
             .expect("URL without sslmode should parse");
 
         assert!(
@@ -1541,8 +1601,11 @@ mod tests {
 
     #[test]
     fn connect_options_default_overrides_url_sslmode() {
-        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=prefer", None, None)
-            .expect("URL with sslmode should parse");
+        let options = pg_connect_options(
+            "postgres://user:pass@example.com/db?sslmode=prefer",
+            &PgTlsConfig::default(),
+        )
+        .expect("URL with sslmode should parse");
 
         assert!(
             matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
@@ -1552,12 +1615,12 @@ mod tests {
 
     #[test]
     fn connect_options_uses_explicit_sslmode_override() {
-        let options = pg_connect_options(
-            "postgres://user:pass@example.com/db?sslmode=verify-full",
-            Some(SslMode::Disable),
-            None,
-        )
-        .expect("URL with override should parse");
+        let tls = PgTlsConfig {
+            ssl_mode: Some(SslMode::Disable),
+            ..PgTlsConfig::default()
+        };
+        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=verify-full", &tls)
+            .expect("URL with override should parse");
 
         assert!(
             matches!(options.get_ssl_mode(), PgSslMode::Disable),
@@ -1567,7 +1630,43 @@ mod tests {
 
     #[test]
     fn connect_options_applies_ssl_root_cert() {
-        pg_connect_options("postgres://user:pass@example.com/db", None, Some("/path/to/ca.pem"))
-            .expect("ssl_root_cert path should be accepted");
+        let tls = PgTlsConfig {
+            ssl_root_cert: Some("/path/to/ca.pem"),
+            ..PgTlsConfig::default()
+        };
+        pg_connect_options("postgres://user:pass@example.com/db", &tls).expect("ssl_root_cert path should be accepted");
+    }
+
+    #[test]
+    fn connect_options_applies_client_cert_and_key() {
+        let tls = PgTlsConfig {
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_root_cert: Some("/path/to/ca.pem"),
+            ssl_client_cert: Some("/path/to/client.pem"),
+            ssl_client_key: Some("/path/to/client.key"),
+            require_certificate_authentication: false,
+        };
+        pg_connect_options("postgres://user@example.com/db", &tls).expect("client cert/key paths should be accepted");
+    }
+
+    #[test]
+    fn connect_options_cert_auth_preserves_addressing() {
+        // The compliance-profile rebuild must retain host, port, username, and
+        // database while dropping password sources.
+        let tls = PgTlsConfig {
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_root_cert: Some("/path/to/ca.pem"),
+            ssl_client_cert: Some("/path/to/client.pem"),
+            ssl_client_key: Some("/path/to/client.key"),
+            require_certificate_authentication: true,
+        };
+        let options = pg_connect_options("postgres://cert-user@example.com:6543/praxis", &tls)
+            .expect("compliance profile URL should parse");
+
+        assert_eq!(options.get_host(), "example.com");
+        assert_eq!(options.get_port(), 6543);
+        assert_eq!(options.get_username(), "cert-user");
+        assert_eq!(options.get_database(), Some("praxis"));
+        assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
     }
 }

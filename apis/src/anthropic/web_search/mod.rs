@@ -5,21 +5,25 @@
 
 mod streaming;
 
-use std::{borrow::Cow, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, NextIterationBody,
-    Rejection, StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, IterationState, NextIterationBody, Rejection, StreamTerminationCause, SubRequestResponseMode,
+    parse_filter_config,
 };
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
-use crate::web_search::{
-    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig, build_config,
-    format_search_results,
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    web_search::{
+        CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
+        build_config, format_search_results,
+    },
 };
 
 /// Registry name and filter-results namespace.
@@ -32,6 +36,11 @@ const ACTION_DONE: &str = "done";
 const REQUEST_ACCUMULATOR_KEY: &str = "anthropic_web_search.request";
 /// Maximum UTF-8 size accepted for a server-managed search query.
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
+
+/// The managed tool name this filter owns in the Anthropic Messages tool list.
+/// Matched both when a request *declares* the tool (credential preflight) and
+/// when a response *calls* it (managed-search classification).
+const MANAGED_TOOL_NAME: &str = "WebSearch";
 
 /// Server-owned search call classified from the accounted previous response.
 #[derive(Debug)]
@@ -56,9 +65,78 @@ enum ResponseDecision {
 
 /// Initial request fields inspected without materializing the full payload.
 #[derive(Deserialize)]
-struct RequestEnvelope {
+struct RequestEnvelope<'a> {
     /// Whether the client requested streaming.
     stream: Option<bool>,
+    /// Declared tools, borrowed and inspected only to detect the managed
+    /// [`MANAGED_TOOL_NAME`] tool this filter will drive a callout for.
+    #[serde(borrow, default)]
+    tools: Vec<RequestTool<'a>>,
+    /// The effective tool selection, inspected only to decide whether the managed
+    /// tool could actually run this turn (see [`Self::managed_web_search_could_run`]).
+    #[serde(borrow, default)]
+    tool_choice: Option<ToolChoiceField<'a>>,
+}
+
+impl RequestEnvelope<'_> {
+    /// Whether the request declares the managed `WebSearch` tool this filter
+    /// owns, so a per-user credential preflight applies to it.
+    fn declares_managed_web_search(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.name.as_ref().and_then(TextField::as_str) == Some(MANAGED_TOOL_NAME))
+    }
+
+    /// Whether the managed `WebSearch` tool could actually be invoked this turn
+    /// under the effective `tool_choice`.
+    ///
+    /// The callout is response-driven: it fires only after the model emits a
+    /// `WebSearch` `tool_use`. A `tool_choice` of `none` forbids all tool calls, and
+    /// `{"type": "tool", "name": X}` forces exactly tool `X`; in both cases the
+    /// managed tool cannot run, so the credential preflight must be skipped to
+    /// avoid a spurious 401 (the re-entry check still fails closed if it ever runs).
+    /// `auto`, `any`, an absent choice, and unknown shapes stay eligible.
+    fn managed_web_search_could_run(&self) -> bool {
+        match self.tool_choice.as_ref() {
+            None => true,
+            Some(ToolChoiceField::Keyword(keyword)) => keyword.as_str() != Some("none"),
+            Some(ToolChoiceField::Object(choice)) => match choice.kind.as_ref().and_then(TextField::as_str) {
+                Some("none") => false,
+                Some("tool") => choice.name.as_ref().and_then(TextField::as_str) == Some(MANAGED_TOOL_NAME),
+                _ => true,
+            },
+        }
+    }
+}
+
+/// One declared tool from the request, inspected only for its name.
+#[derive(Deserialize)]
+struct RequestTool<'a> {
+    /// Tool name, matched against [`MANAGED_TOOL_NAME`].
+    #[serde(borrow)]
+    name: Option<TextField<'a>>,
+}
+
+/// The request's `tool_choice`, accepting both the object form Anthropic emits and
+/// the bare-string keyword the messages converter also tolerates.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolChoiceField<'a> {
+    /// Object form, e.g. `{"type": "auto" | "any" | "none" | "tool", "name": "..."}`.
+    Object(#[serde(borrow)] ToolChoiceObject<'a>),
+    /// Bare keyword string, or any other non-object value (kept, never fatal).
+    Keyword(#[serde(borrow)] TextField<'a>),
+}
+
+/// The object form of `tool_choice`, inspected only for its type and named tool.
+#[derive(Deserialize)]
+struct ToolChoiceObject<'a> {
+    /// Selection type: `auto`, `any`, `none`, or `tool`.
+    #[serde(rename = "type", borrow)]
+    kind: Option<TextField<'a>>,
+    /// The tool name forced when `kind` is `tool`.
+    #[serde(borrow)]
+    name: Option<TextField<'a>>,
 }
 
 /// A borrowed JSON string or an ignored value of another type.
@@ -145,6 +223,12 @@ struct ResponseEnvelope<'a> {
 
 /// Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 ///
+/// Each provider request is executed through the shared filtered-subrequest
+/// executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and
+/// `Host` centrally. An optional `outbound_chain` runs operator-managed
+/// cross-cutting filters on the callout; when omitted it defaults to an empty
+/// inline chain (pure passthrough), so the central protections still apply.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -159,6 +243,7 @@ struct ResponseEnvelope<'a> {
 /// filter: anthropic_web_search
 /// provider: you
 /// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_body_bytes: 67108864
@@ -188,46 +273,112 @@ pub struct AnthropicWebSearchFilter {
     terminal_streaming: bool,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
+    /// Prebuilt outbound filter chain each provider request executes through.
+    outbound: Arc<FilterPipeline>,
+    /// Callout-credential slot id whose per-user secret is required for the
+    /// provider callout. `None` uses the shared configured `api_key`.
+    user_credential_slot: Option<String>,
 }
 
 impl AnthropicWebSearchFilter {
-    /// Create a filter with an isolated subrequest client.
+    /// Create a filter with an isolated subrequest client, binding its
+    /// configured outbound chain through `ctx`.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when the filter configuration is invalid.
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client =
-            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
-        Self::build(config, client)
+    /// Returns [`FilterError`] when the configuration is invalid or the
+    /// outbound chain cannot be bound.
+    pub fn from_chain_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::build(config, client, ctx)
     }
 
-    /// Create a filter with the server's shared subrequest client.
+    /// Create a filter with the server's shared subrequest client, binding its
+    /// configured outbound chain through `ctx`.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when the filter configuration is invalid.
-    pub fn from_config_with_client(
+    /// Returns [`FilterError`] when the configuration is invalid or the
+    /// outbound chain cannot be bound.
+    pub fn from_chain_binding_with_client(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Build the filter around the supplied subrequest client.
+    /// Build the filter around the supplied subrequest client, binding the
+    /// outbound chain once via [`ChainBindingContext::bind_chain`].
     fn build(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, config)?;
-        let validated = build_config(FILTER_NAME, &config)?;
+        // Bind the operator-configured outbound chain. A `Named` reference
+        // resolves against the top-level `filter_chains` map; an `Inline`
+        // reference embeds directly. The executor seeds and re-pins
+        // `filter_ctx.upstream` from the `StagedUpstream` the search client
+        // stages, so the chain needs no upstream-selecting filter of its own.
+        let outbound = Arc::new(ctx.bind_chain(&config.outbound_chain)?);
+        Self::assemble(&config, client, outbound)
+    }
+
+    /// Validate the parsed config and assemble the filter around an
+    /// already-bound outbound pipeline.
+    fn assemble(
+        config: &WebSearchFilterConfig,
+        client: crate::subrequest::SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let validated = build_config(FILTER_NAME, config)?;
         let search_client = SearchClient::from_config(FILTER_NAME, &validated, client)?;
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
             terminal_streaming: validated.terminal_streaming,
             search_client,
+            outbound,
+            user_credential_slot: validated.user_credential,
         }))
+    }
+
+    /// Test-only convenience constructor binding a minimal outbound chain.
+    ///
+    /// Production registers `anthropic_web_search` as a chain-binding filter and
+    /// supplies the operator-configured outbound chain (see
+    /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
+    /// exercise loop logic bind a minimal builtin-only chain, since the
+    /// [`FilteredSubrequestExecutor`] seeds the upstream from the search
+    /// client's `StagedUpstream` and still enforces destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` centrally.
+    ///
+    /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+    #[cfg(test)]
+    fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Test-only convenience constructor (shared client, minimal outbound chain).
+    ///
+    /// See [`from_config`](Self::from_config).
+    #[cfg(test)]
+    fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // `outbound_chain` is optional, so fixtures that omit it parse via the
+        // default. Bind a minimal builtin-only pipeline for tests (the executor
+        // still enforces SSRF/TLS/Host regardless of chain contents); private
+        // upstreams are permitted so tests can dial loopback mocks.
+        let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, config)?;
+        let outbound = crate::web_search::test_outbound_pipeline()?;
+        Self::assemble(&config, client, Arc::new(outbound))
     }
 
     /// Align the Praxis subrequest response transport with the outbound body.
@@ -249,13 +400,86 @@ impl AnthropicWebSearchFilter {
         ctx.set_subrequest_response_mode(mode);
     }
 
+    /// Resolve the caller's trusted owner and the operator-required per-user
+    /// credential for the web-search callout.
+    ///
+    /// Projects the caller's [`StateOwner`](crate::state_owner::StateOwner) into
+    /// the callout and, when a `user_credential` slot is configured, selects the
+    /// matching per-user secret. A configured-but-missing slot fails closed: it
+    /// maps to a 401 `authentication_error` [`Rejection`]. Anthropic's error
+    /// envelope carries a `type` but no `code`; only the non-secret slot id is
+    /// surfaced in the message.
+    fn resolve_callout_identity(&self, ctx: &HttpFilterContext<'_>) -> Result<CalloutIdentity, Rejection> {
+        stage_callout_identity(ctx, self.user_credential_slot.as_deref()).map_err(
+            |CalloutContextMissing::Credential { slot }| {
+                anthropic_rejection(
+                    401,
+                    "authentication_error",
+                    &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+                )
+            },
+        )
+    }
+
+    /// Whether this request body is an IRR re-entry (a later agentic round),
+    /// distinguished by the router-owned [`IterationState`] carrying the previous
+    /// round's response. A fresh, first-round request has none.
+    fn is_reentry(ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.extensions
+            .get::<IterationState>()
+            .and_then(|state| state.previous_response.as_ref())
+            .is_some()
+    }
+
+    /// Preflight the required per-user credential before the first inference
+    /// stream begins.
+    ///
+    /// The re-entry credential check runs only after round 0, by which point
+    /// terminal streaming may have already committed HTTP 200 — too late to fail
+    /// closed. When the request declares the managed [`MANAGED_TOOL_NAME`] tool
+    /// this filter will drive a callout for *and* the effective `tool_choice`
+    /// leaves it eligible to run, resolve the slot now so a missing credential is
+    /// rejected before any backend round or provider callout runs. The identity is
+    /// re-derived at re-entry from the same context, so this only proves presence
+    /// and discards its result. A `tool_choice` that makes the managed tool
+    /// ineligible skips the preflight so a legitimate request is not falsely
+    /// rejected; re-entry still fails closed if the callout ever runs.
+    fn preflight_managed_credential(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        request: &RequestEnvelope<'_>,
+    ) -> Result<(), Rejection> {
+        if self.user_credential_slot.is_some()
+            && request.declares_managed_web_search()
+            && request.managed_web_search_could_run()
+        {
+            self.resolve_callout_identity(ctx)?;
+        }
+        Ok(())
+    }
+
     /// Execute one pending call, returning the provider outcome.
     ///
     /// A provider failure never rejects the Messages response: the caller
     /// appends a truthful `is_error` tool result so the loop can continue.
-    async fn execute_pending_search(&self, pending: &PendingSearch) -> SearchOutcome {
+    ///
+    /// `callout` carries the originating client's attributes and the request's
+    /// current outbound depth so the callout's outbound chain sees the real
+    /// caller and the executor continues this request's depth accounting.
+    async fn execute_pending_search(
+        &self,
+        callout: CalloutContext,
+        pending: &PendingSearch,
+        identity: &CalloutIdentity,
+    ) -> SearchOutcome {
         self.search_client
-            .search(&pending.query, Some(self.default_context_size))
+            .search(
+                &self.outbound,
+                callout,
+                &pending.query,
+                Some(self.default_context_size),
+                identity,
+            )
             .await
     }
 
@@ -318,7 +542,19 @@ impl AnthropicWebSearchFilter {
                 "messages must be an array for web search re-entry",
             )));
         }
-        let outcome = self.execute_pending_search(&pending).await;
+        // Capture the caller's attributes and this request's outbound depth
+        // before mutating the context so the callout's outbound chain sees the
+        // real client and the executor continues this request's depth accounting.
+        let callout = CalloutContext::from_filter_context(ctx);
+        // PR1 (issue #880) Task 10: project the caller's trusted owner into the
+        // web-search callout and select the operator-required per-user credential.
+        // A configured-but-missing slot fails closed with a 401
+        // `authentication_error` terminal before any provider callout runs.
+        let identity = match self.resolve_callout_identity(ctx) {
+            Ok(identity) => identity,
+            Err(rejection) => return Ok(FilterAction::Reject(rejection)),
+        };
+        let outcome = self.execute_pending_search(callout, &pending, &identity).await;
         if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &outcome) {
             return Ok(FilterAction::Reject(rejection));
         }
@@ -420,6 +656,25 @@ impl HttpFilter for AnthropicWebSearchFilter {
         "anthropic_web_search"
     }
 
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(
+                false,
+                "anthropic_web_search outbound pipeline must be uniquely owned during configuration"
+            );
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
+    }
+
     fn request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
@@ -475,19 +730,14 @@ impl HttpFilter for AnthropicWebSearchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx
-            .extensions
-            .get::<IterationState>()
-            .and_then(|state| state.previous_response.as_ref())
-            .is_some()
-        {
+        if Self::is_reentry(ctx) {
             return self.handle_reentry(ctx, body).await;
         }
 
         let Some(bytes) = body.as_deref() else {
             return Ok(FilterAction::Continue);
         };
-        let request: RequestEnvelope = match serde_json::from_slice(bytes) {
+        let request: RequestEnvelope<'_> = match serde_json::from_slice(bytes) {
             Ok(value) => value,
             Err(_) => return Ok(FilterAction::Continue),
         };
@@ -498,6 +748,9 @@ impl HttpFilter for AnthropicWebSearchFilter {
                 "invalid_request_error",
                 "streaming is not supported with anthropic_web_search",
             )));
+        }
+        if let Err(rejection) = self.preflight_managed_credential(ctx, &request) {
+            return Ok(FilterAction::Reject(rejection));
         }
         self.apply_streaming_transport(ctx, streaming);
 
@@ -850,7 +1103,7 @@ fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
     if tools.next().is_some() {
         return ResponseDecision::Done;
     }
-    if tool.name.as_ref().and_then(TextField::as_str) != Some("WebSearch") {
+    if tool.name.as_ref().and_then(TextField::as_str) != Some(MANAGED_TOOL_NAME) {
         return ResponseDecision::Done;
     }
     let Some(id) = tool

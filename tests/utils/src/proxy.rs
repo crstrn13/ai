@@ -28,13 +28,83 @@ use tokio::sync::Notify;
 // -----------------------------------------------------------------------------
 
 /// Default sub-request client for registry-only tests without a config.
-fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+///
+/// The connector builds a rustls client config, which needs the process-wide
+/// crypto provider first: the binary installs it at startup, and the harness
+/// does the same here (a no-op after the first call). Tests that build a
+/// registry themselves must take their client from here for the same reason.
+/// The install goes through [`crate::ensure_crypto_provider`], which fails
+/// closed on a declared FIPS host that is not in FIPS mode.
+pub fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+    crate::net::tls::ensure_crypto_provider();
     praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
 }
 
 /// Shared client honoring runtime connector settings, including the circuit breaker.
 fn configured_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
+    crate::net::tls::ensure_crypto_provider();
     praxis_ai::create_subrequest_client(config)
+}
+
+// -----------------------------------------------------------------------------
+// Binary Location
+// -----------------------------------------------------------------------------
+
+/// Environment variable naming the `praxis-ai` binary subprocess tests spawn.
+///
+/// `make test-integration-fips` points it at the FIPS build so the binary
+/// under test is the FIPS one, not whatever the harness would build.
+pub const PRAXIS_AI_BIN_ENV: &str = "PRAXIS_AI_BIN";
+
+/// Path to the `praxis-ai` binary for subprocess integration tests.
+///
+/// Uses [`PRAXIS_AI_BIN_ENV`] when set, then `CARGO_BIN_EXE_praxis-ai`;
+/// otherwise resolves under `CARGO_TARGET_DIR` (including llvm-cov's
+/// alternate target dir). Never builds it: an in-test `cargo build`
+/// inherits whatever instrumentation and target-dir locks the outer run
+/// holds, and under coverage that turns a missing binary into a
+/// many-minute rebuild that times the job out. The Makefile targets that
+/// run this suite build the binary first and name it through
+/// [`PRAXIS_AI_BIN_ENV`].
+///
+/// # Panics
+///
+/// Panics if [`PRAXIS_AI_BIN_ENV`] names a file that does not exist, or if
+/// no binary is present at the resolved path.
+pub fn praxis_ai_bin() -> PathBuf {
+    if let Some(explicit) = std::env::var_os(PRAXIS_AI_BIN_ENV) {
+        let path = PathBuf::from(explicit);
+        assert!(
+            path.is_file(),
+            "{PRAXIS_AI_BIN_ENV} names {} but there is no such file",
+            path.display()
+        );
+        return path;
+    }
+
+    let path = resolve_praxis_ai_bin_path();
+    assert!(
+        path.exists(),
+        "no praxis-ai binary at {}; build it first (cargo build -p praxis-ai-proxy --bin praxis-ai) \
+         or point {PRAXIS_AI_BIN_ENV} at one, as the make targets do",
+        path.display()
+    );
+    path
+}
+
+/// The path cargo puts the `praxis-ai` binary at, without building it.
+fn resolve_praxis_ai_bin_path() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_praxis-ai").map_or_else(
+        || {
+            let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+                || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"),
+                PathBuf::from,
+            );
+            let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+            target.join(profile).join("praxis-ai")
+        },
+        PathBuf::from,
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -78,13 +148,13 @@ fn resolve_listener_pipeline(
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.set_subrequest_client(client.clone());
     // Mirror the server: propagate the private-upstream override into the
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
+    praxis_ai::install_pipeline_extensions(&mut pipeline);
     pipeline.apply_insecure_options(&config.insecure_options);
     Arc::new(pipeline)
 }

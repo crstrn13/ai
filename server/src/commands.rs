@@ -34,6 +34,13 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     praxis_core::logging::validate_log_overrides(config)?;
     let subrequest_client = praxis_ai::create_subrequest_client(config);
     let registry = praxis_ai::build_full_registry(&subrequest_client);
+    // The same refusal the server makes at boot, so `--validate` under
+    // PRAXIS_REQUIRE_FIPS answers for the binary it runs as.
+    if praxis_tls::provider::required()
+        && let Some(reason) = praxis_ai::fips_blocker(&registry)
+    {
+        return Err(reason.into());
+    }
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
@@ -110,6 +117,8 @@ filter_chains:
 
     #[test]
     fn validate_rejects_unknown_filter_type() {
+        // Validation builds a sub-request client, which needs the provider first.
+        praxis_ai::install_crypto_provider();
         let config = Config::from_yaml(
             r#"
 listeners:
@@ -165,6 +174,8 @@ filter_chains:
 
     #[test]
     fn validate_accepts_subrequest_circuit_breaker_config() {
+        // Validation builds a sub-request client, which needs the provider first.
+        praxis_ai::install_crypto_provider();
         let config = Config::from_yaml(
             r#"
 listeners:

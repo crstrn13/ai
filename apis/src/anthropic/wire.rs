@@ -11,6 +11,14 @@ use serde_json::{Map, Value};
 /// Fallback error body used only if Serde serialization fails.
 const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":"api_error","message":"failed to serialize error response"},"request_id":null}"#;
 
+/// Return whether an Anthropic tool-use identifier satisfies the wire schema.
+pub(crate) fn is_valid_tool_use_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// Complete Anthropic Messages response.
 #[derive(Serialize)]
 pub(crate) struct MessageResponse<'a> {
@@ -29,7 +37,7 @@ pub(crate) struct MessageResponse<'a> {
     /// Reason generation stopped.
     pub stop_reason: String,
     /// Matched stop sequence, when available.
-    pub stop_sequence: Option<&'static str>,
+    pub stop_sequence: Option<&'a str>,
     /// Response discriminator.
     pub r#type: &'static str,
     /// Token and service usage.
@@ -106,6 +114,8 @@ pub(crate) struct MessageUsage {
     pub input_tokens: u64,
     /// Generated output tokens.
     pub output_tokens: u64,
+    /// Breakdown of output tokens by category, when available.
+    pub output_tokens_details: Option<Value>,
     /// Server tool usage, when reported.
     pub server_tool_use: Option<Value>,
     /// Service tier, when reported.
@@ -122,6 +132,7 @@ impl MessageUsage {
             inference_geo: None,
             input_tokens,
             output_tokens,
+            output_tokens_details: None,
             server_tool_use: None,
             service_tier: None,
         }
@@ -139,6 +150,8 @@ pub(crate) struct MessageDeltaUsage {
     pub input_tokens: Option<u64>,
     /// Cumulative generated output tokens.
     pub output_tokens: u64,
+    /// Breakdown of output tokens by category, when available.
+    pub output_tokens_details: Option<Value>,
     /// Server tool usage, when reported.
     pub server_tool_use: Option<Value>,
 }
@@ -151,6 +164,7 @@ impl MessageDeltaUsage {
             cache_read_input_tokens,
             input_tokens,
             output_tokens,
+            output_tokens_details: None,
             server_tool_use: None,
         }
     }

@@ -3,10 +3,14 @@
 
 //! Unit tests for the `openai_mcp_dispatch` filter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use bytes::Bytes;
 use praxis_filter::FilterAction;
+use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
@@ -17,19 +21,20 @@ use super::{
     prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
+    callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
-                ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call,
-                build_denial_message, extract_approval_responses, is_approval_response, parse_approval_response,
-                resolve_approval, target_fingerprint,
+                ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
+                bind_owner_context, build_approved_tool_call, build_denial_message, extract_approval_responses,
+                is_approval_response, owner_fingerprint, parse_approval_response, resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
         openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
-        state::{DeferredMcpConnector, McpApprovalState, ResponsesState},
+        state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
     store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},
     test_utils::{make_filter_context, make_owned_filter_context, make_request},
@@ -87,15 +92,21 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
 }
 
 fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions<'static> {
+    // These tests dial unreachable/loopback targets so no call ever succeeds and
+    // nothing is ever pooled; a shared empty pool is inert here.
+    static POOL: OnceLock<crate::mcp_client::McpSessionPool> = OnceLock::new();
+    static NAMESPACE: OnceLock<crate::mcp_client::McpPoolNamespace> = OnceLock::new();
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         timeout,
-        allow_loopback: true,
         forwarded_header_names: &[],
         forwarded_headers: None,
+        connector_identity: None,
+        session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
+        pool_namespace: *NAMESPACE.get_or_init(crate::mcp_client::McpPoolNamespace::new),
     }
 }
 
@@ -1079,7 +1090,7 @@ fn from_config_minimal() {
 #[test]
 fn from_config_with_all_fields() {
     let config = serde_yaml::from_str::<serde_yaml::Value>(
-        "timeout_ms: 5000\nallow_loopback: true\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
+        "timeout_ms: 5000\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
     )
     .unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
@@ -1090,6 +1101,68 @@ fn from_config_with_all_fields() {
 fn from_config_rejects_zero_timeout() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("timeout_ms: 0").unwrap();
     assert!(McpDispatchFilter::from_config(&config).is_err());
+}
+
+#[test]
+fn from_config_rejects_inline_outbound_chain() {
+    // The plain-builtin `from_config` path has no chain-binding context, so it
+    // cannot bind *any* configured `outbound_chain` (inline or named). Production
+    // registers this filter as chain-binding via `from_config_with_binding`; the
+    // plain path must reject a configured chain rather than silently drop it.
+    let config = serde_yaml::from_str::<serde_yaml::Value>(
+        "outbound_chain:\n  name: mcp-outbound\n  filters:\n    - filter: headers\n      request_set:\n        - name: x-probe\n          value: v\n",
+    )
+    .unwrap();
+    let Err(error) = McpDispatchFilter::from_config(&config) else {
+        panic!("a configured outbound_chain must be rejected by the plain builtin path");
+    };
+    assert!(
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
+    );
+}
+
+#[test]
+fn from_config_rejects_named_outbound_chain() {
+    // The plain-builtin path rejects a named chain for the same reason as an
+    // inline one: it has no chain-binding context to resolve it.
+    let config = serde_yaml::from_str::<serde_yaml::Value>("outbound_chain: mcp-outbound\n").unwrap();
+    let Err(error) = McpDispatchFilter::from_config(&config) else {
+        panic!("a named outbound_chain must be rejected");
+    };
+    assert!(
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
+    );
+}
+
+#[test]
+fn require_inline_outbound_chain_accepts_none_and_inline() {
+    // The chain-binding path (`from_config_with_binding`) accepts an inline chain
+    // (bound at IRR step-build time) and the omitted case (empty chain).
+    use praxis_core::config::ChainRef;
+    super::config::require_inline_outbound_chain(None).expect("None must be accepted");
+    let inline = ChainRef::Inline {
+        name: "mcp-outbound".to_owned(),
+        filters: Vec::new(),
+    };
+    super::config::require_inline_outbound_chain(Some(&inline)).expect("an inline chain must be accepted");
+}
+
+#[test]
+fn require_inline_outbound_chain_rejects_named() {
+    // A named reference cannot resolve inside the IRR step (empty step-level
+    // named-chain map), so the chain-binding path rejects it up front with a
+    // clear inline-required error.
+    use praxis_core::config::ChainRef;
+    let named = ChainRef::Named("mcp-outbound".to_owned());
+    let Err(error) = super::config::require_inline_outbound_chain(Some(&named)) else {
+        panic!("a named outbound_chain must be rejected");
+    };
+    assert!(
+        error.to_string().contains("must be defined inline"),
+        "error should require an inline chain: {error}"
+    );
 }
 
 // =========================================================================
@@ -1103,9 +1176,14 @@ async fn execute_single_call_missing_name_returns_none() {
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-            .await
-            .is_none()
+        execute_single_call(
+            &tc,
+            &McpToolIndex::new(&map),
+            &options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_none()
     );
 }
 
@@ -1116,9 +1194,14 @@ async fn execute_single_call_unknown_tool_returns_none() {
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-            .await
-            .is_none()
+        execute_single_call(
+            &tc,
+            &McpToolIndex::new(&map),
+            &options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_none()
     );
 }
 
@@ -1128,9 +1211,14 @@ async fn execute_single_call_ambiguous_returns_error() {
     let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
 }
 
@@ -1140,9 +1228,14 @@ async fn execute_single_call_malformed_args_returns_error() {
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
 }
 
@@ -1152,9 +1245,14 @@ async fn execute_single_call_connection_error() {
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(
         result.message["output"].as_str().unwrap().starts_with("Error:"),
         "should report connection/timeout error"
@@ -1169,9 +1267,14 @@ async fn execute_single_call_connection_error() {
 async fn execute_mcp_calls_empty_input() {
     let map = sample_tool_map();
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&[], &McpToolIndex::new(&map), execution_options(false, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &[],
+        &McpToolIndex::new(&map),
+        execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(results.is_empty());
 }
 
@@ -1184,6 +1287,7 @@ async fn execute_mcp_calls_sequential() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1200,6 +1304,7 @@ async fn execute_mcp_calls_parallel() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(true, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1219,9 +1324,14 @@ async fn execute_mcp_calls_parallel_preserves_order_across_bounded_chunks() {
 
     let mut options = execution_options(true, timeout);
     options.max_parallel_calls = 2;
-    let results = execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let ids: Vec<&str> = results
         .iter()
@@ -1239,6 +1349,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1255,6 +1366,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1272,9 +1384,14 @@ async fn execute_mcp_calls_rejects_an_aggregate_result_overflow() {
     options.max_total_result_bytes = 1;
 
     assert!(
-        execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
-            .await
-            .is_err()
+        execute_mcp_calls(
+            &call_refs(&calls),
+            &McpToolIndex::new(&map),
+            options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -1333,6 +1450,26 @@ fn process_call_result_image_content_is_preserved() {
 fn make_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     McpDispatchFilter::from_config(&yaml).unwrap()
+}
+
+fn make_scoped_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("authorization_assertion: mcp_gateway").unwrap();
+    McpDispatchFilter::from_config(&yaml).unwrap()
+}
+
+/// A dispatch filter whose bound outbound pipeline permits private/loopback
+/// upstreams, mirroring a deployment with `insecure_options.allow_private_upstreams`.
+///
+/// Tests that need a genuine *runtime* dial failure (connection refused,
+/// timeout) against a loopback address use this so the SSRF guard admits the
+/// dial instead of rejecting it up front as a local policy failure. Mirrors the
+/// finalization walk Praxis performs, which flips the pipeline's SSRF posture
+/// via `set_allow_private_upstreams` while the outbound pipeline is still
+/// uniquely owned.
+fn make_dispatch_filter_allow_private() -> Box<dyn praxis_filter::HttpFilter> {
+    let mut filter = make_dispatch_filter();
+    filter.visit_nested_pipelines(&mut |pipeline| pipeline.set_allow_private_upstreams(true));
+    filter
 }
 
 fn auto_approval_tool_map() -> HashMap<(String, String), serde_json::Value> {
@@ -1603,6 +1740,126 @@ async fn on_request_no_mcp_calls_returns_continue() {
 }
 
 #[tokio::test]
+async fn configured_deferred_connector_missing_assertion_records_security_failure_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+        deferred_mcp: vec![DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "corp_drive".to_owned(),
+            headers: None,
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "drive".to_owned(),
+            server_url: "https://mcp.example/mcp".to_owned(),
+            timeout: std::time::Duration::from_secs(1),
+        }],
+        tool_search_calls: vec![search.clone()],
+        accumulated_output: vec![search.clone()],
+        response_object: json!({"output": [search]}),
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("missing assertion should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+}
+
+#[tokio::test]
+async fn configured_connector_call_missing_assertion_records_security_failure_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("drive".to_owned(), "search".to_owned()),
+        json!({
+            "connector_id": "corp_drive",
+            "server_label": "drive",
+            "server_url": "https://mcp.example/mcp",
+            "name": "search"
+        }),
+    );
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+        mcp_tool_map: tool_map,
+        tool_calls: vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("drive", "search"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("missing assertion should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+}
+
+#[tokio::test]
+async fn connector_call_rejects_dispatch_context_policy_mismatch_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("drive".to_owned(), "search".to_owned()),
+        json!({
+            "connector_id": "corp_drive",
+            "server_label": "drive",
+            "server_url": "https://mcp.example/mcp",
+            "name": "search"
+        }),
+    );
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(Some("different_bearer"), None),
+        mcp_tool_map: tool_map,
+        tool_calls: vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("drive", "search"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("a mismatched resolver/dispatch policy should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+    assert!(failure.message.contains("does not match tool resolution"));
+}
+
+#[tokio::test]
 async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -1614,7 +1871,6 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
     let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
     ctx.extensions.insert(ResponsesState {
         deferred_mcp: vec![DeferredMcpConnector {
-            allow_loopback: true,
             authorization: None,
             allowed_tools: None,
             connector_id: "corp_drive".to_owned(),
@@ -1658,7 +1914,10 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let filter = make_dispatch_filter();
+    // Permit the loopback dial so it fails at *connect* (a runtime failure that
+    // defers to the header phase) rather than being rejected up front by the
+    // SSRF guard as a local policy failure.
+    let filter = make_dispatch_filter_allow_private();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
@@ -1673,7 +1932,6 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.response_id = Some("resp_deferred_listing_failure".to_owned());
     state.deferred_mcp = vec![DeferredMcpConnector {
-        allow_loopback: true,
         authorization: None,
         allowed_tools: None,
         connector_id: "corp_drive".to_owned(),
@@ -1949,7 +2207,7 @@ async fn resolve_to_dispatch_execute_with_original_name() {
 /// The resolved tool-map entry for the `weather` server shared by the approval
 /// tests.
 ///
-/// A loopback URL under the default `allow_loopback=false` policy makes any
+/// A loopback URL under the default `allow_private=false` policy makes any
 /// executed approved call fail closed instantly via the SSRF guard — no
 /// network round trip, no timeout wait. The resume/consume/inject logic is
 /// what these tests exercise; `build_error_result` still preserves the
@@ -2064,7 +2322,7 @@ async fn seed_weather_approval_for_owner(
 /// A fresh in-memory SQLite store for the approval-consumption path.
 async fn make_approval_store() -> Arc<dyn ResponseStore> {
     Arc::new(
-        SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None)
+        SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None, None)
             .await
             .expect("in-memory store should initialize"),
     )
@@ -2941,6 +3199,75 @@ fn target_fingerprint_fails_closed_on_case_insensitive_duplicate_headers() {
         target_fingerprint(&reversed).is_empty(),
         "case-insensitive duplicate header names must fail closed"
     );
+}
+
+#[test]
+fn connector_target_fingerprint_binds_full_owner_tuple() {
+    let owner_a = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "same-subject").unwrap();
+    let owner_b = crate::StateOwner::from_trusted_parts("tenant-b", "issuer-a", "same-subject").unwrap();
+    let owner_c = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-b", "same-subject").unwrap();
+    assert_ne!(owner_fingerprint(&owner_a), owner_fingerprint(&owner_b));
+    assert_ne!(owner_fingerprint(&owner_a), owner_fingerprint(&owner_c));
+
+    let mut entry_a = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut entry_b = entry_a.clone();
+    bind_owner_context(&mut entry_a, Some(&owner_a));
+    bind_owner_context(&mut entry_b, Some(&owner_b));
+    assert_ne!(target_fingerprint(&entry_a), target_fingerprint(&entry_b));
+}
+
+#[test]
+fn connector_target_fingerprint_binds_effective_bearer() {
+    let mut entry_a = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut entry_b = entry_a.clone();
+    let bearer_a = SecretString::from("bearer-a");
+    let bearer_b = SecretString::from("bearer-b");
+    bind_credential_context(&mut entry_a, Some(&bearer_a));
+    bind_credential_context(&mut entry_b, Some(&bearer_b));
+
+    assert_ne!(target_fingerprint(&entry_a), target_fingerprint(&entry_b));
+    assert!(!entry_a.to_string().contains("bearer-a"));
+    assert!(!entry_b.to_string().contains("bearer-b"));
+}
+
+#[test]
+fn connector_target_fingerprint_survives_assertion_rotation() {
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let first_identity = McpCalloutIdentity::for_test(owner.clone(), None, Some(SecretString::from("assertion-v1")));
+    let second_identity = McpCalloutIdentity::for_test(owner, None, Some(SecretString::from("assertion-v2")));
+    let mut first_entry = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut second_entry = first_entry.clone();
+    bind_owner_context(&mut first_entry, Some(first_identity.owner()));
+    bind_owner_context(&mut second_entry, Some(second_identity.owner()));
+
+    assert_eq!(
+        target_fingerprint(&first_entry),
+        target_fingerprint(&second_entry),
+        "raw rotating assertions must never enter the approval target fingerprint"
+    );
+}
+
+#[test]
+fn direct_url_target_never_retains_owner_fingerprint() {
+    let owner = crate::StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+    let mut entry = json!({
+        "server_url": "https://mcp.example/mcp",
+        "_praxis_owner_fingerprint": "forged",
+        "_praxis_credential_fingerprint": "forged"
+    });
+    bind_owner_context(&mut entry, Some(&owner));
+    bind_credential_context(&mut entry, Some(&SecretString::from("bearer")));
+    assert!(entry.get("_praxis_owner_fingerprint").is_none());
+    assert!(entry.get("_praxis_credential_fingerprint").is_none());
 }
 
 #[test]

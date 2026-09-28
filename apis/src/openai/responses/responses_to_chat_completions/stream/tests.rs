@@ -39,10 +39,17 @@ fn converter(limits: StreamLimits) -> StreamConverter {
     StreamConverter::new(RESPONSE_ID.to_owned(), CREATED_AT, limits)
 }
 
+/// Borrow the request body's tool declarations for a snapshot, mirroring how
+/// production threads `state.tools` into [`SnapshotInputs`].
+fn tools_of(body: &Value) -> &[Value] {
+    body.get("tools").and_then(Value::as_array).map_or(&[], Vec::as_slice)
+}
+
 /// Feed one chunk and append any emitted bytes to `raw`.
 fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
         request_body: body,
+        tools: tools_of(body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -55,6 +62,7 @@ fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8
 fn finish(conv: &mut StreamConverter, body: &Value, raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
         request_body: body,
+        tools: tools_of(body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -176,6 +184,51 @@ fn text_path_emits_canonical_sequence() {
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
     });
     assert_eq!(events[9].1["response"], finite_resource(&full));
+}
+
+#[test]
+fn streaming_translation_handles_nonzero_zero_and_absent_cache_write_counts() {
+    // 1. Nonzero cache_write_tokens
+    let events_nonzero = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":2}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_nonzero = &events_nonzero.last().unwrap().1["response"];
+    assert_eq!(completed_nonzero["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(
+        completed_nonzero["usage"]["input_tokens_details"]["cache_write_tokens"],
+        2
+    );
+
+    // 2. Explicit zero cache_write_tokens
+    let events_zero = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":0}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_zero = &events_zero.last().unwrap().1["response"];
+    assert_eq!(completed_zero["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(completed_zero["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+
+    // 3. Absent cache_write_tokens
+    let events_absent = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_absent = &events_absent.last().unwrap().1["response"];
+    assert_eq!(completed_absent["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(
+        completed_absent["usage"]["input_tokens_details"]["cache_write_tokens"],
+        0
+    );
 }
 
 #[test]
@@ -455,6 +508,86 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
 }
 
 #[test]
+fn streaming_file_search_echo_uses_hosted_tools_after_backend_lowering() {
+    // The streamed response object echoes tools/tool_choice on response.created
+    // and response.completed. openai_file_search_callout lowers request_body to a
+    // private `function` for the backend, while state.tools/state.tool_choice
+    // retain the client's hosted declaration; the client-visible stream must echo
+    // the hosted form, never the private shim.
+    let lowered_request_body = json!({
+        "model": "chat-only-model",
+        "input": "find revenue",
+        "stream": true,
+        "tools": [{
+            "type": "function",
+            "name": "file_search",
+            "description": "Search the configured vector stores for relevant files.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            },
+            "strict": true
+        }],
+        "tool_choice": {"type": "function", "name": "file_search"}
+    });
+    let hosted_tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_q4"]})];
+    let hosted_tool_choice = json!({"type": "file_search"});
+    let inputs = SnapshotInputs {
+        request_body: &lowered_request_body,
+        tools: &hosted_tools,
+        original_tool_choice: Some(&hosted_tool_choice),
+        now: NOW,
+    };
+
+    let mut conv = converter(wide_limits());
+    let mut raw = Vec::new();
+    let stream = provider_stream(&[
+        r#"{"id":"c1","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
+        r#"{"id":"c1","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{"content":"Revenue was strong."}}]}"#,
+        r#"{"id":"c1","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    ]);
+    if let Some(bytes) = conv.push(&stream, &inputs).unwrap() {
+        raw.extend_from_slice(&bytes);
+    }
+    if let Some(bytes) = conv.finish(&inputs).unwrap() {
+        raw.extend_from_slice(&bytes);
+    }
+    let events = parse_events(&raw);
+
+    let created = events
+        .iter()
+        .find(|(name, _)| name == "response.created")
+        .expect("stream must emit a response.created frame");
+    assert_eq!(
+        created.1["response"]["tools"][0]["type"], "file_search",
+        "response.created must echo the hosted file_search tool, not the private function"
+    );
+    assert_eq!(
+        created.1["response"]["tools"][0]["vector_store_ids"],
+        json!(["vs_q4"]),
+        "hosted vector_store_ids must survive into the streamed echo"
+    );
+    assert_eq!(
+        created.1["response"]["tool_choice"],
+        json!({"type": "file_search"}),
+        "response.created must echo the hosted forced tool_choice"
+    );
+
+    let terminal = events.last().expect("stream must emit a terminal frame");
+    assert_eq!(terminal.0, "response.completed");
+    assert_eq!(
+        terminal.1["response"]["tools"][0]["type"], "file_search",
+        "response.completed must echo the hosted file_search tool, not the private function"
+    );
+    assert_eq!(
+        terminal.1["response"]["tool_choice"],
+        json!({"type": "file_search"}),
+        "response.completed must echo the hosted forced tool_choice"
+    );
+}
+
+#[test]
 fn incomplete_hosted_web_search_uses_a_valid_item_status() {
     let body = json!({
         "model": "gpt-4.1-mini",
@@ -696,6 +829,7 @@ fn partial_frame_after_terminal_fails_at_eof() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1129,6 +1263,7 @@ fn trailing_frame_after_terminal_in_later_callback_fails() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1150,6 +1285,7 @@ fn trailing_frame_after_terminal_in_same_callback_fails() {
     let mut conv = converter(wide_limits());
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1183,6 +1319,7 @@ fn empty_callback_after_terminal_is_tolerated() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1247,6 +1384,7 @@ fn empty_stream_with_tiny_event_budget_still_emits_failed() {
         let mut conv = converter(limits);
         let inputs = SnapshotInputs {
             request_body: &body,
+            tools: tools_of(&body),
             original_tool_choice: None,
             now: NOW,
         };
@@ -1354,6 +1492,7 @@ fn timeout_emits_failed() {
     // First push establishes the start time.
     let first = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: 100,
     };
@@ -1369,6 +1508,7 @@ fn timeout_emits_failed() {
     // A later push beyond the timeout window fails.
     let late = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: 200,
     };
@@ -1489,6 +1629,7 @@ fn failed_terminal_does_not_echo_unbounded_request_fields() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1545,6 +1686,7 @@ fn failed_terminal_fallback_is_schema_complete() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1615,6 +1757,7 @@ fn failed_terminal_fallback_is_bounded_by_request_fields() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1671,6 +1814,7 @@ fn bounded_failure_has_null_completed_at() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -1718,6 +1862,7 @@ fn finish_after_timeout_emits_failed() {
     // terminal (no `[DONE]`), so the terminal is deferred to `finish`.
     let started = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: 100,
     };
@@ -1733,6 +1878,7 @@ fn finish_after_timeout_emits_failed() {
     // The EOF callback arrives well past the timeout window.
     let elapsed = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: 200,
     };
@@ -1909,6 +2055,7 @@ fn large_lifecycle_frame_needs_accumulator_headroom() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -2015,6 +2162,7 @@ fn lifecycle_frame_overflow_rolls_back_the_pair() {
     });
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -2162,6 +2310,7 @@ fn terminal_over_byte_limit_fails_without_committed_items() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -2222,6 +2371,7 @@ fn oversized_lifecycle_frame_fails_closed_with_minimal_snapshot() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -2310,6 +2460,7 @@ fn minimal_failed_frame_persists_under_default_accumulator() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };
@@ -2483,6 +2634,7 @@ fn minimal_terminal_fits_at_floor_ceiling() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        tools: tools_of(&body),
         original_tool_choice: None,
         now: NOW,
     };

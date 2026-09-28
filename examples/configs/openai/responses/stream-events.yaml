@@ -1,5 +1,5 @@
 # Streaming Event Accumulation
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Demonstrates the `openai_stream_events` filter, which composes the
 # current iterative-request-router (IRR) execution into one logical
@@ -60,7 +60,7 @@
 #     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}"
 #
 # Requires the ai-inference feature:
-#   cargo build -p praxis --features ai-inference
+#   cargo build -p praxis-ai-proxy --features store-sqlite
 
 listeners:
   - name: ai-gateway
@@ -74,15 +74,13 @@ filter_chains:
         mode: trusted_owner
         header: x-authenticated-state-owner
 
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
-
-      - filter: openai_responses_validate
 
       - filter: openai_response_store
         backend: sqlite

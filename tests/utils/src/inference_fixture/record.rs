@@ -1078,7 +1078,7 @@ fn build_provider_client_with_timeout(
     root: Option<reqwest::Certificate>,
     request_timeout: Duration,
 ) -> Result<reqwest::Client, FixtureError> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::inference_fixture::http_client_builder()
         .no_proxy()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
@@ -1094,7 +1094,7 @@ fn build_provider_client_with_timeout(
 
 /// Builds the capability-bearing client with proxies and redirects disabled.
 fn build_recorder_hop_client() -> Result<reqwest::Client, FixtureError> {
-    reqwest::Client::builder()
+    crate::inference_fixture::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -1104,7 +1104,7 @@ fn build_recorder_hop_client() -> Result<reqwest::Client, FixtureError> {
 
 /// Builds the single redirect-free client used for all scenario turns.
 fn build_scenario_client() -> Result<reqwest::Client, FixtureError> {
-    reqwest::Client::builder()
+    crate::inference_fixture::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -3312,6 +3312,10 @@ mod tests {
         provider.finish().await;
     }
 
+    // Drives the Responses proxy with a sqlite-backed response store to persist
+    // and rebind `previous_response_id` across turns, so it needs the
+    // store-sqlite backend compiled in (run via `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[tokio::test]
     async fn record_live_binds_previous_response_id_across_responses_turns() {
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -3676,13 +3680,13 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             let key = rustls_pemfile::private_key(&mut &*key_pem).unwrap().unwrap();
-            let config =
-                rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-                    .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-                    .unwrap()
-                    .with_no_client_auth()
-                    .with_single_cert(certificate_chain, key)
-                    .unwrap();
+            // On the process-wide provider (the OpenSSL-backed one the
+            // harness installs); no aws-lc-rs is compiled in anymore.
+            crate::net::tls::ensure_crypto_provider();
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certificate_chain, key)
+                .unwrap();
             let acceptor = TlsAcceptor::from(Arc::new(config));
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3801,7 +3805,7 @@ mod tests {
     }
 
     fn test_client() -> reqwest::Client {
-        reqwest::Client::builder()
+        crate::inference_fixture::http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .build()
@@ -3811,7 +3815,7 @@ mod tests {
     fn authorized_client(recorder: &super::RecordingProxyGuard) -> reqwest::Client {
         let mut headers = HeaderMap::new();
         headers.insert(RECORDER_CAPABILITY_HEADER.clone(), recorder.capability().clone());
-        reqwest::Client::builder()
+        crate::inference_fixture::http_client_builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
@@ -3933,6 +3937,8 @@ mod tests {
         }
     }
 
+    // Only referenced by the store-sqlite-gated live recording test above.
+    #[cfg(feature = "store-sqlite")]
     fn live_responses_scenario() -> InferenceScenario {
         InferenceScenario {
             version: 1,
@@ -3949,6 +3955,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "store-sqlite")]
     fn live_responses_turn(name: &str, prompt: &str, previous_response_id: Option<&str>) -> ScenarioTurn {
         let mut value = json!({
             "model": "${MODEL}",

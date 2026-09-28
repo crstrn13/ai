@@ -75,6 +75,10 @@ pub(super) struct StreamLimits {
 pub(super) struct SnapshotInputs<'a> {
     /// Original canonical Responses request body.
     pub(super) request_body: &'a Value,
+    /// Client-visible tool declarations, echoed instead of any backend-lowered
+    /// forms in `request_body` (e.g. a hosted `file_search` tool that
+    /// `openai_file_search_callout` rewrote to a private `function`).
+    pub(super) tools: &'a [Value],
     /// Client-visible tool choice preserved across internal agentic rounds.
     pub(super) original_tool_choice: Option<&'a Value>,
     /// Current wall-clock time in seconds.
@@ -695,7 +699,8 @@ impl StreamConverter {
         }
         self.lifecycle_started = true;
         let context = self.response_context(inputs, None);
-        let resource = in_progress_response_resource(&context);
+        let resource =
+            in_progress_response_resource(&context).map_err(|_error| ConvertError::InvalidTerminalResource)?;
         if serialized_json_len(&resource)? > self.limits.max_body_bytes {
             return Err(ConvertError::ByteLimit);
         }
@@ -1417,7 +1422,8 @@ impl StreamConverter {
         // terminal never streamed completion events for the accumulated items.
         let synthetic = self.synthetic_completion("stop");
         let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .unwrap_or_else(|_| in_progress_response_resource(&context));
+            .or_else(|_| in_progress_response_resource(&context))
+            .unwrap_or_else(|_| minimal_failed_resource(&context, message));
         mark_failed(&mut resource, message);
         // The partial snapshot can be arbitrarily large — this failure may itself
         // be the byte-limit trip, and the snapshot echoes request-controlled
@@ -1639,6 +1645,10 @@ impl StreamConverter {
     fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
         let mut context =
             ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at);
+        // Echo the client's canonical tools/tool_choice, not any backend-lowered
+        // forms in request_body (openai_file_search_callout rewrites a hosted
+        // file_search tool into a private function for the backend).
+        context.tools = inputs.tools;
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
         }

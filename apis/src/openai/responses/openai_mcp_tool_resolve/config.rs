@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use praxis_core::config::ChainRef;
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 use url::Url;
@@ -53,6 +54,16 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
+    /// Optional per-user bearer slot from `callout_credentials`. Must match the
+    /// corresponding `openai_mcp_dispatch` setting.
+    #[serde(default)]
+    pub user_credential: Option<String>,
+
+    /// Optional opaque assertion slot from `callout_credentials.assertions`. Must match
+    /// the corresponding `openai_mcp_dispatch` setting.
+    #[serde(default)]
+    pub authorization_assertion: Option<String>,
+
     /// Trusted request headers forwarded to connector-backed MCP `initialize`
     /// and `tools/list` requests.
     /// No request headers are forwarded by default. Credential headers such as
@@ -71,7 +82,9 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default = "default_max_rewritten_body_bytes")]
     pub max_rewritten_body_bytes: usize,
 
-    /// Per-server timeout in milliseconds for `tools/list` calls.
+    /// Per-server timeout in milliseconds for `tools/list` calls. Inside an
+    /// iterative request router, initialize and listing exchanges are capped by
+    /// the router's remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
@@ -83,12 +96,21 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default = "default_max_tools")]
     pub max_tools: usize,
 
-    /// Allow connections to loopback addresses (`127.0.0.0/8`,
-    /// `::1`, `localhost`). Disabled by default for SSRF
-    /// protection; enable for development environments where MCP
-    /// servers run locally.
+    /// Outbound filter chain the MCP `tools/list` callout runs through.
+    ///
+    /// The chain is bound at build time and carries only operator-configured
+    /// cross-cutting filters, which observe and can act on the outbound MCP
+    /// request. The SSRF-validated dial target is staged by the transport, so no
+    /// upstream-selecting filter is prepended. Both an inline chain and a named
+    /// reference (resolved against the top-level `filter_chains`) are accepted,
+    /// because this filter binds at top level. When omitted, the callout runs
+    /// through an empty chain and dials the staged target directly.
+    ///
+    /// Whether loopback/private MCP destinations are permitted is governed by
+    /// the operator's global insecure posture (which pipeline finalization
+    /// applies to this bound chain), not a per-filter flag.
     #[serde(default)]
-    pub allow_loopback: bool,
+    pub outbound_chain: Option<ChainRef>,
 
     /// Named connectors mapping connector IDs to server URLs.
     #[serde(default)]
@@ -119,6 +141,8 @@ fn default_max_tools() -> usize {
 pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
     crate::openai::api_client::validate_forward_headers("openai_mcp_tool_resolve", &mut cfg.forward_headers)?;
     reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
+    validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
+    validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",
@@ -135,6 +159,16 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
     }
     validate_connectors(&cfg.connectors)?;
     Ok(cfg)
+}
+
+/// Validate one optional request-scoped context slot name.
+fn validate_context_slot(field: &str, slot: Option<&str>) -> Result<(), FilterError> {
+    if let Some(slot) = slot
+        && (slot.is_empty() || slot.len() > 128)
+    {
+        return Err(format!("openai_mcp_tool_resolve: {field} must be 1..=128 bytes").into());
+    }
+    Ok(())
 }
 
 /// Reject ambient credentials and protocol-controlled fields at MCP's

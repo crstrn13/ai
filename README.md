@@ -1,6 +1,4 @@
-<p align="center">
-  <img width="3159" height="540" alt="Praxis AI" src="https://github.com/user-attachments/assets/0c33e340-a3d4-42e5-93f3-c1e3817b8f35">
-</p>
+<img width="1200" height="400" alt="praxis-ai-banner" src="https://github.com/user-attachments/assets/2696dc84-22ad-4a34-81d8-962f7ace86c0" />
 
 [![Tests](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml)
 [![Coverage: ≥95%](https://img.shields.io/badge/Coverage-≥95%25-brightgreen.svg)](https://github.com/praxis-proxy/ai/actions/workflows/coverage.yaml)
@@ -75,6 +73,11 @@ make release
 ./target/release/praxis-ai
 ```
 
+`make release` builds the `full` feature set. A plain
+`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
+leaves out the stateful OpenAI filter groups and their dependencies; see
+[Cargo features](docs/features.md#cargo-features).
+
 Then check that it is running:
 
 ```console
@@ -118,7 +121,9 @@ docker pull ghcr.io/praxis-proxy/ai:0.2
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
-and the [release documentation] for image contents and tagging.
+and the [release documentation] for image contents and tagging. A FIPS 140-3
+build for Red Hat Enterprise Linux hosts is published under the same tags
+with a `-fips` suffix; see [FIPS 140-3](docs/fips.md).
 
 ## Contributing
 
