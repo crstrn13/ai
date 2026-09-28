@@ -17,7 +17,6 @@ mod azure_ad;
 mod azure_translation;
 #[cfg(feature = "store-sqlite")]
 mod compact;
-mod credential_inject_parity;
 mod credential_injection;
 mod external_metering;
 mod file_search_callout;
