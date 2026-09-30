@@ -46,6 +46,12 @@ use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::config::{ExternalMeteringConfig, validate_config};
+// Import the token metadata keys from `token_count`, their sole writer, so this
+// reader can never drift to a stale literal and silently meter zero tokens.
+use crate::token_usage::{
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
+    META_TOKEN_TOTAL,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -63,27 +69,6 @@ const CE_TYPE_USAGE: &str = "inference.tokens.used";
 /// Metadata key holding the resolved model name, written during the request
 /// body phase and read during the response body phase.
 const META_METERING_MODEL: &str = "metering.model";
-
-/// Well-known `filter_metadata` key for input tokens (set by `token_count`).
-const META_TOKEN_INPUT: &str = "token.input";
-
-/// Well-known `filter_metadata` key for output tokens (set by `token_count`).
-const META_TOKEN_OUTPUT: &str = "token.output";
-
-/// Well-known `filter_metadata` key for total tokens (set by `token_count`).
-const META_TOKEN_TOTAL: &str = "token.total";
-
-/// Well-known `filter_metadata` key for prompt cache reads (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_READ: &str = "token.cache_read";
-
-/// Well-known `filter_metadata` key for prompt cache writes (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
-
-/// Well-known `filter_metadata` key for reasoning/thinking tokens (set by
-/// `token_count`). A breakdown of [`META_TOKEN_OUTPUT`], not an addition to it.
-const META_TOKEN_REASONING: &str = "token.reasoning";
 
 /// Counter incremented whenever a usage or error event fails to reach the
 /// metering service (transport failure or non-2xx acknowledgement).
