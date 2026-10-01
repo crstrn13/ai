@@ -14,6 +14,7 @@ mod anthropic_messages;
 mod anthropic_messages_native_vllm;
 mod anthropic_messages_to_openai_vllm;
 mod anthropic_web_search_scoped_credentials;
+mod anthropic_web_search_to_openai_vllm;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
@@ -24,6 +25,8 @@ mod client_tool_compat_chat_completions;
 mod compact;
 mod credential_injection;
 mod external_metering;
+#[cfg(target_os = "linux")]
+mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
@@ -73,7 +76,7 @@ mod openai_response_store;
 mod openai_response_store_postgres;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres_mtls;
-#[cfg(feature = "openai-file-resolve-filter")]
+#[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
@@ -101,6 +104,8 @@ mod responses_to_chat_completions_reasoning;
 mod session_replay;
 mod stream_usage_inject;
 mod time_to_first_token;
+#[cfg(feature = "token-ceiling-filter")]
+mod token_ceiling;
 mod token_count;
 mod token_counting;
 #[cfg(feature = "token-rate-limit-filter")]
