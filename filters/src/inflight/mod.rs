@@ -128,7 +128,7 @@ impl HttpFilter for InFlightTrackerFilter {
         };
 
         let Some(registry) = ctx.extensions.get::<InFlightRegistry>().cloned() else {
-            return Ok(FilterAction::BodyDone); // extension not installed
+            return Ok(FilterAction::BodyDone);
         };
 
         let (model, cap) = extract_model_and_cap(bytes);

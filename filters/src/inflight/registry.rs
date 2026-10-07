@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use tracing::trace;
 
 /// Live counters for a single model.
 ///
@@ -66,6 +67,13 @@ impl InFlightRegistry {
         entry.in_flight = entry.in_flight.saturating_add(1);
         entry.reserved_tokens = entry.reserved_tokens.saturating_add(max_tokens);
 
+        trace!(
+            model,
+            in_flight = entry.in_flight,
+            reserved_tokens = entry.reserved_tokens,
+            "inflight: request start"
+        );
+
         max_tokens
     }
 
@@ -79,10 +87,17 @@ impl InFlightRegistry {
     pub fn on_request_complete(&self, model: &str, reserved: u64) {
         let drained = {
             let Some(mut entry) = self.inner.get_mut(model) else {
+                trace!(model, "inflight: stray completion ignored");
                 return;
             };
             entry.in_flight = entry.in_flight.saturating_sub(1);
             entry.reserved_tokens = entry.reserved_tokens.saturating_sub(reserved);
+            trace!(
+                model,
+                in_flight = entry.in_flight,
+                reserved_tokens = entry.reserved_tokens,
+                "inflight: request complete"
+            );
             entry.in_flight == 0 && entry.reserved_tokens == 0
         };
 
