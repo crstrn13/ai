@@ -195,6 +195,12 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "prompt_enrich" => PromptEnrichFilter::from_config
     );
+    register_request_metadata_filters(registry);
+    register_token_filters(registry);
+}
+
+/// Register filters that observe per-request metadata (timing, in-flight load).
+fn register_request_metadata_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
@@ -203,7 +209,6 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "inflight_tracker" => InFlightTrackerFilter::from_config
     );
-    register_token_filters(registry);
 }
 
 /// Register token counting/usage/rate-limiting filters.

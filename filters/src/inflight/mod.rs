@@ -9,7 +9,7 @@
 //! read to bias model selection toward the least-loaded backend.
 //!
 //! The decrement is driven by [`Drop`], not a response hook. On request start
-//! the filter parks an [`InFlightGuard`] in `ctx.filter_state`; the per-request
+//! the filter parks an `InFlightGuard` in `ctx.filter_state`; the per-request
 //! context is dropped on *every* terminal path — success, client abort, upstream
 //! error, timeout — so the guard's `Drop` always runs exactly once and the
 //! counters can never leak upward. Response hooks are not reliable on aborted
@@ -89,7 +89,7 @@ impl Drop for InFlightGuard {
 #[async_trait]
 impl HttpFilter for InFlightTrackerFilter {
     fn name(&self) -> &'static str {
-        FILTER_NAME
+        "inflight_tracker"
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
