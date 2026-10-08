@@ -18,13 +18,12 @@
 mod config;
 mod registry;
 
-pub use registry::{InFlightRegistry, ModelMetrics};
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
+pub use registry::{InFlightRegistry, ModelMetrics};
 
 use self::config::{InFlightConfig, validate_config};
 use crate::json_scan::TopLevelKeyScanner;
@@ -114,7 +113,6 @@ impl HttpFilter for InFlightTrackerFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
@@ -135,7 +133,11 @@ impl HttpFilter for InFlightTrackerFilter {
         let model = model.unwrap_or_else(|| self.default_model.clone());
         let reserved = registry.on_request_start(&model, cap.unwrap_or(0));
 
-        ctx.insert_filter_state(InFlightGuard { registry, model, reserved });
+        ctx.insert_filter_state(InFlightGuard {
+            registry,
+            model,
+            reserved,
+        });
         Ok(FilterAction::BodyDone)
     }
 }

@@ -46,7 +46,11 @@ fn example_config_inflight_tracking_passthrough() {
         200,
         "a tracked request should proxy with inflight_tracker in the pipeline"
     );
-    assert_eq!(parse_body(&raw), JSON_BODY, "response body should pass through unchanged");
+    assert_eq!(
+        parse_body(&raw),
+        JSON_BODY,
+        "response body should pass through unchanged"
+    );
 }
 
 #[test]
@@ -61,9 +65,20 @@ fn example_config_inflight_tracking_untracked_request_passthrough() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"hi"}]}"#),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
     );
 
-    assert_eq!(parse_status(&raw), 200, "an untracked request should still proxy cleanly");
-    assert_eq!(parse_body(&raw), JSON_BODY, "response body should pass through unchanged");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an untracked request should still proxy cleanly"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        JSON_BODY,
+        "response body should pass through unchanged"
+    );
 }
