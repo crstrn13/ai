@@ -103,6 +103,14 @@ impl<'a> TopLevelKeyScanner<'a> {
         let after_colon = self.rest.trim_start().strip_prefix(':')?;
         let digits = after_colon.trim_start();
         let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+        if end == 0 {
+            return None; // not a number (null, string, negative, ...)
+        }
+        // A digit run followed by '.', 'e', or 'E' is a float or exponent, not
+        // an integer; reject it rather than silently truncating to the digits.
+        if digits[end..].starts_with(['.', 'e', 'E']) {
+            return None;
+        }
         digits.get(..end)?.parse().ok()
     }
 }
@@ -156,7 +164,8 @@ mod tests {
     #[test]
     fn u64_value_rejects_non_integer_values() {
         assert_eq!(u64_of(r#"{"max_tokens": null}"#, "max_tokens"), None);
-        assert_eq!(u64_of(r#"{"max_tokens": 1.5}"#, "max_tokens"), Some(1));
+        assert_eq!(u64_of(r#"{"max_tokens": 1.5}"#, "max_tokens"), None);
+        assert_eq!(u64_of(r#"{"max_tokens": 1e3}"#, "max_tokens"), None);
         assert_eq!(u64_of(r#"{"max_tokens": "100"}"#, "max_tokens"), None);
     }
 
