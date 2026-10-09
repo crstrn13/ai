@@ -145,34 +145,65 @@ impl HttpFilter for InFlightTrackerFilter {
     }
 }
 
-/// Accumulate the first `model` and token cap seen into bounded per-request
-/// state, scanning one streamed chunk. Finds a model that lands in a later chunk
-/// instead of committing a premature default, and never buffers the body.
-/// Creating the state also records that a body was seen.
+/// Upper bound on the leading request-body bytes buffered for a single
+/// depth-correct scan. The top-level `model` and token cap sit at the front of
+/// the body, so this is ample; a model past the cap falls back to
+/// `default_model`. The buffer is per-request, bounded, and freed as soon as
+/// both fields resolve, so the full body is never buffered.
+const PREFIX_SCAN_CAP: usize = 16 * 1024;
+
+/// Accumulate a bounded leading prefix across streamed chunks and resolve the
+/// `model` and token cap from one depth-aware scan of it.
+///
+/// Scanning the contiguous prefix (rather than each chunk independently) keeps
+/// the JSON nesting depth correct across chunk boundaries: a chunk that starts
+/// inside a nested object can't have its keys mistaken for top-level ones, and a
+/// value split across a boundary resolves once the next chunk completes it. The
+/// prefix is capped and dropped as soon as both fields are known, so a large
+/// body is never buffered in full. Creating the state records that a body was
+/// seen, so a bodyless request stays uncounted.
 fn scan_chunk(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
-    let (model, cap) = extract_model_and_cap(bytes);
     if ctx.get_filter_state::<PendingScan>().is_none() {
         ctx.insert_filter_state(PendingScan::default());
     }
-    if let Some(pending) = ctx.get_filter_state_mut::<PendingScan>() {
-        if pending.model.is_none() {
-            pending.model = model;
-        }
-        if pending.cap.is_none() {
-            pending.cap = cap;
-        }
+    let Some(pending) = ctx.get_filter_state_mut::<PendingScan>() else {
+        return;
+    };
+    if pending.done {
+        return; // both fields resolved (or cap hit); later chunks add nothing
+    }
+
+    let room = PREFIX_SCAN_CAP.saturating_sub(pending.prefix.len());
+    if let Some(slice) = bytes.get(..room.min(bytes.len())) {
+        pending.prefix.extend_from_slice(slice);
+    }
+
+    let (model, cap) = extract_model_and_cap(&pending.prefix);
+    pending.model = model;
+    pending.cap = cap;
+
+    if (pending.model.is_some() && pending.cap.is_some()) || pending.prefix.len() >= PREFIX_SCAN_CAP {
+        pending.done = true;
+        pending.prefix = Vec::new();
     }
 }
 
 /// Bounded per-request scan state carried across body chunks until the count is
-/// committed at end-of-stream. Holds only the extracted fields, never the body.
+/// committed at end-of-stream.
 #[derive(Default)]
 struct PendingScan {
-    /// Top-level `model`, once a chunk has revealed it.
+    /// Leading body bytes accumulated for one depth-correct scan; freed once the
+    /// fields resolve or the cap is hit.
+    prefix: Vec<u8>,
+
+    /// Top-level `model`, once the prefix has revealed it.
     model: Option<String>,
 
-    /// Token cap (`max_tokens`/`max_output_tokens`), once a chunk has revealed it.
+    /// Token cap (`max_tokens`/`max_output_tokens`), once the prefix reveals it.
     cap: Option<u64>,
+
+    /// Set when both fields resolve or the cap is reached; stops further scanning.
+    done: bool,
 }
 
 /// Extract the top-level `model` and token cap from a JSON request body chunk.
@@ -181,9 +212,9 @@ struct PendingScan {
 /// of `max_tokens` (Anthropic / Chat Completions) or `max_output_tokens` (OpenAI
 /// Responses) to appear. Both are read in a single pass; a key nested inside
 /// `messages` content is never surfaced, so a decoy there cannot misattribute
-/// the request. Either component is `None` when its key is absent from this
-/// chunk, carries the wrong JSON type, or is cut off by the chunk boundary; the
-/// caller scans each streamed chunk and keeps the first value it finds.
+/// the request. Either component is `None` when its key is absent, carries the
+/// wrong JSON type, or is cut off by the end of `bytes`; the caller feeds a
+/// bounded leading prefix of the body, grown across chunks until both resolve.
 fn extract_model_and_cap(bytes: &[u8]) -> (Option<String>, Option<u64>) {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return (None, None);
@@ -280,5 +311,42 @@ mod tests {
         let (model, cap) = extract_model_and_cap(body);
         assert_eq!(model, None);
         assert_eq!(cap, None);
+    }
+
+    #[tokio::test]
+    async fn attributes_top_level_model_across_chunk_boundary_not_nested_decoy() {
+        // The chunk split lands so the second chunk starts inside the nested
+        // `metadata` object: scanning chunks independently would read
+        // {"model":"decoy"} as top-level. A depth-correct scan of the joined
+        // prefix must attribute the real top-level model instead.
+        let filter = InFlightTrackerFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let registry = InFlightRegistry::new();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
+        ctx.extensions.insert(registry.clone());
+
+        let mut chunk1 = Some(Bytes::from_static(br#"{"metadata":"#));
+        let a1 = filter.on_request_body(&mut ctx, &mut chunk1, false).await.unwrap();
+        assert!(matches!(a1, FilterAction::Continue));
+        let mut chunk2 = Some(Bytes::from_static(
+            br#"{"model":"decoy"},"model":"gpt-4","max_tokens":5}"#,
+        ));
+        let a2 = filter.on_request_body(&mut ctx, &mut chunk2, true).await.unwrap();
+        assert!(matches!(a2, FilterAction::Continue));
+
+        assert_eq!(
+            registry.get("gpt-4"),
+            ModelMetrics {
+                in_flight: 1,
+                reserved_tokens: 5
+            },
+            "the real top-level model must win over the nested decoy"
+        );
+        assert_eq!(
+            registry.get("decoy"),
+            ModelMetrics::default(),
+            "a model nested inside metadata must never be counted"
+        );
     }
 }
