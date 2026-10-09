@@ -108,7 +108,7 @@ impl<'a> TopLevelKeyScanner<'a> {
         }
         // A digit run followed by '.', 'e', or 'E' is a float or exponent, not
         // an integer; reject it rather than silently truncating to the digits.
-        if digits[end..].starts_with(['.', 'e', 'E']) {
+        if digits.get(end..).is_some_and(|rest| rest.starts_with(['.', 'e', 'E'])) {
             return None;
         }
         digits.get(..end)?.parse().ok()

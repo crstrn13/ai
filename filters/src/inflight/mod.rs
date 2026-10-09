@@ -50,6 +50,27 @@ impl InFlightTrackerFilter {
             default_model: cfg.default_model,
         }))
     }
+
+    /// Commit the accumulated scan as one in-flight count, parking the guard.
+    ///
+    /// A request that scanned nothing (no body) is left uncounted. The in-flight
+    /// window is then `[request complete, response complete]`, the span a load
+    /// scorer cares about.
+    fn commit(&self, ctx: &mut HttpFilterContext<'_>) {
+        let Some((model, cap)) = ctx.get_filter_state::<PendingScan>().map(|p| (p.model.clone(), p.cap)) else {
+            return;
+        };
+        let Some(registry) = ctx.extensions.get::<InFlightRegistry>().cloned() else {
+            return; // extension not installed; no-op
+        };
+        let model = model.unwrap_or_else(|| self.default_model.clone());
+        let reserved = registry.on_request_start(&model, cap.unwrap_or(0));
+        ctx.insert_filter_state(InFlightGuard {
+            registry,
+            model,
+            reserved,
+        });
+    }
 }
 
 /// RAII guard parked in `ctx.filter_state` for the request's lifetime.
@@ -105,36 +126,53 @@ impl HttpFilter for InFlightTrackerFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        // Count exactly once: once the guard is parked, later chunks are no-ops.
+        // Already counted (guard parked): nothing more to do this request.
         if ctx.get_filter_state::<InFlightGuard>().is_some() {
             return Ok(FilterAction::Continue);
         }
 
-        // Wait for the first non-empty chunk, where the leading top-level fields
-        // live; a bodyless request is never counted.
-        let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
-            return Ok(FilterAction::Continue);
-        };
+        // Scan each chunk as it streams; commit the count once at end-of-stream.
+        if let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) {
+            scan_chunk(ctx, bytes);
+        }
+        if end_of_stream {
+            self.commit(ctx);
+        }
 
-        // Clone the registry out of extensions so the borrow on `ctx` ends
-        // before the mutable insert below.
-        let Some(registry) = ctx.extensions.get::<InFlightRegistry>().cloned() else {
-            return Ok(FilterAction::Continue); // extension not installed; no-op
-        };
-
-        let (model, cap) = extract_model_and_cap(bytes);
-        let model = model.unwrap_or_else(|| self.default_model.clone());
-        let reserved = registry.on_request_start(&model, cap.unwrap_or(0));
-
-        ctx.insert_filter_state(InFlightGuard {
-            registry,
-            model,
-            reserved,
-        });
         Ok(FilterAction::Continue)
     }
+}
+
+/// Accumulate the first `model` and token cap seen into bounded per-request
+/// state, scanning one streamed chunk. Finds a model that lands in a later chunk
+/// instead of committing a premature default, and never buffers the body.
+/// Creating the state also records that a body was seen.
+fn scan_chunk(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
+    let (model, cap) = extract_model_and_cap(bytes);
+    if ctx.get_filter_state::<PendingScan>().is_none() {
+        ctx.insert_filter_state(PendingScan::default());
+    }
+    if let Some(pending) = ctx.get_filter_state_mut::<PendingScan>() {
+        if pending.model.is_none() {
+            pending.model = model;
+        }
+        if pending.cap.is_none() {
+            pending.cap = cap;
+        }
+    }
+}
+
+/// Bounded per-request scan state carried across body chunks until the count is
+/// committed at end-of-stream. Holds only the extracted fields, never the body.
+#[derive(Default)]
+struct PendingScan {
+    /// Top-level `model`, once a chunk has revealed it.
+    model: Option<String>,
+
+    /// Token cap (`max_tokens`/`max_output_tokens`), once a chunk has revealed it.
+    cap: Option<u64>,
 }
 
 /// Extract the top-level `model` and token cap from a JSON request body chunk.
@@ -143,9 +181,9 @@ impl HttpFilter for InFlightTrackerFilter {
 /// of `max_tokens` (Anthropic / Chat Completions) or `max_output_tokens` (OpenAI
 /// Responses) to appear. Both are read in a single pass; a key nested inside
 /// `messages` content is never surfaced, so a decoy there cannot misattribute
-/// the request. Either component is `None` when its key is absent, carries the
-/// wrong JSON type, or falls past the end of the chunk — these fields sit at the
-/// front of the body, so the first chunk carries them in practice.
+/// the request. Either component is `None` when its key is absent from this
+/// chunk, carries the wrong JSON type, or is cut off by the chunk boundary; the
+/// caller scans each streamed chunk and keeps the first value it finds.
 fn extract_model_and_cap(bytes: &[u8]) -> (Option<String>, Option<u64>) {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return (None, None);
