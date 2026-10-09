@@ -6,8 +6,7 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-/// Metadata key the model is written under during the request phase and read
-/// back during the response phase (mirrors `metering.model`).
+/// Model name attributed when neither config nor the request body supplies one.
 pub(super) const DEFAULT_MODEL_FALLBACK: &str = "unknown";
 
 /// YAML config for the `inflight_tracker` filter.
@@ -23,9 +22,6 @@ pub(super) struct InFlightConfig {
     /// from silently vanishing for clients that omit `model`.
     #[serde(default = "default_model")]
     pub default_model: String,
-    // TASK 5 (optional): add knobs here as you need them, e.g. a cap on the
-    // number of distinct model keys to bound memory. Remember `deny_unknown_fields`
-    // means every YAML key must map to a field here.
 }
 
 /// Validate config at construction time.

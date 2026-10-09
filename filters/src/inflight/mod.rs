@@ -31,13 +31,6 @@ use crate::json_scan::TopLevelKeyScanner;
 /// Public filter type name used in YAML and registration.
 pub const FILTER_NAME: &str = "inflight_tracker";
 
-/// Upper bound on request-body bytes buffered to read the top-level `model` and
-/// token cap, matching the Praxis `json_body_field` default (10 MiB). A larger
-/// body is still forwarded upstream, but any top-level field past the limit is
-/// unseen — `in_flight` stays correct regardless; only the token reservation can
-/// under-count.
-const MAX_SCAN_BYTES: usize = 10 * 1024 * 1024;
-
 /// Tracks live request counts and reserved tokens per model.
 pub struct InFlightTrackerFilter {
     /// Model attributed when the request body reveals none.
@@ -100,33 +93,35 @@ impl HttpFilter for InFlightTrackerFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        // Buffer the body so a single pass sees both `model` and the token cap,
-        // wherever they sit among the top-level fields.
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_SCAN_BYTES),
-        }
+        // Stream, never StreamBuffer: a passive tracker must not cap request
+        // size. A bounded StreamBuffer rejects bodies over its limit with 413,
+        // and an unbounded one buffers every request in full. The top-level
+        // `model` and token cap sit at the front of the body, so a per-chunk
+        // scan reads them without buffering or rejecting anything.
+        BodyMode::Stream
     }
 
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
+        _end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
+        // Count exactly once: once the guard is parked, later chunks are no-ops.
+        if ctx.get_filter_state::<InFlightGuard>().is_some() {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx.get_filter_state::<InFlightGuard>().is_some() {
-            return Ok(FilterAction::BodyDone);
-        }
-
+        // Wait for the first non-empty chunk, where the leading top-level fields
+        // live; a bodyless request is never counted.
         let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
             return Ok(FilterAction::Continue);
         };
 
+        // Clone the registry out of extensions so the borrow on `ctx` ends
+        // before the mutable insert below.
         let Some(registry) = ctx.extensions.get::<InFlightRegistry>().cloned() else {
-            return Ok(FilterAction::BodyDone);
+            return Ok(FilterAction::Continue); // extension not installed; no-op
         };
 
         let (model, cap) = extract_model_and_cap(bytes);
@@ -138,18 +133,19 @@ impl HttpFilter for InFlightTrackerFilter {
             model,
             reserved,
         });
-        Ok(FilterAction::BodyDone)
+        Ok(FilterAction::Continue)
     }
 }
 
-/// Extract the top-level `model` and token cap from a complete JSON request body.
+/// Extract the top-level `model` and token cap from a JSON request body chunk.
 ///
 /// Returns the top-level `model` string and the reservation taken from the first
 /// of `max_tokens` (Anthropic / Chat Completions) or `max_output_tokens` (OpenAI
-/// Responses) to appear. Both are read in a single pass over the buffered body;
-/// a key nested inside `messages` content is never surfaced, so a decoy there
-/// cannot misattribute the request. Either component is `None` when its key is
-/// absent or carries the wrong JSON type.
+/// Responses) to appear. Both are read in a single pass; a key nested inside
+/// `messages` content is never surfaced, so a decoy there cannot misattribute
+/// the request. Either component is `None` when its key is absent, carries the
+/// wrong JSON type, or falls past the end of the chunk — these fields sit at the
+/// front of the body, so the first chunk carries them in practice.
 fn extract_model_and_cap(bytes: &[u8]) -> (Option<String>, Option<u64>) {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return (None, None);
