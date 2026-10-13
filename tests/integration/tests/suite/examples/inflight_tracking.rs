@@ -62,3 +62,19 @@ fn example_config_inflight_tracking_forwards_untracked_request_unchanged() {
         "an untracked request must also forward unchanged"
     );
 }
+
+#[test]
+fn example_config_inflight_tracking_forwards_large_request_unchanged() {
+    // The filter used to select a bounded StreamBuffer, which rejected bodies
+    // over its limit with 413 before the filter's own logic ever ran (fixed in
+    // 0334c61a). A body well past that old limit must still arrive
+    // byte-identical, so a regression back to a size-capping body mode would
+    // be caught here rather than only by the (also tiny) tests above.
+    let filler = "a".repeat(64 * 1024);
+    let req_body = format!(r#"{{"messages":[{{"role":"user","content":"{filler}"}}],"model":"gpt-4","max_tokens":5}}"#);
+    assert_eq!(
+        forward(&req_body),
+        req_body,
+        "a request body well past 16 KiB must still forward unchanged"
+    );
+}

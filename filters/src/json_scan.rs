@@ -10,8 +10,9 @@
 //! `messages` content can never misattribute the request.
 //!
 //! Shared by the `external_metering` and `inflight_tracker` filters; the
-//! former scans per chunk for `model`, the latter buffers the full body and
-//! scans once for `model` plus the token cap.
+//! former scans per chunk for `model`, the latter carries a small resumable
+//! scan state across chunks for `model` plus the token cap, never buffering
+//! the body.
 
 /// Extract the top-level `model` field from a JSON body fragment.
 ///
@@ -90,29 +91,6 @@ impl<'a> TopLevelKeyScanner<'a> {
         let end = find_string_end(value, 0)?;
         value.get(..end)
     }
-
-    /// Read the unsigned integer value following the key just returned.
-    ///
-    /// Returns `None` when the value is not a bare non-negative integer
-    /// (e.g. `null`, a float, a quoted string, or a fragment cut off before
-    /// the number). Reading the value does not advance the scanner, so a
-    /// subsequent [`next_top_level_key`] harmlessly re-scans and skips it.
-    ///
-    /// [`next_top_level_key`]: Self::next_top_level_key
-    pub(crate) fn u64_value(&self) -> Option<u64> {
-        let after_colon = self.rest.trim_start().strip_prefix(':')?;
-        let digits = after_colon.trim_start();
-        let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
-        if end == 0 {
-            return None; // not a number (null, string, negative, ...)
-        }
-        // A digit run followed by '.', 'e', or 'E' is a float or exponent, not
-        // an integer; reject it rather than silently truncating to the digits.
-        if digits.get(end..).is_some_and(|rest| rest.starts_with(['.', 'e', 'E'])) {
-            return None;
-        }
-        digits.get(..end)?.parse().ok()
-    }
 }
 
 /// Find the byte offset of the unescaped closing quote for the string
@@ -136,47 +114,6 @@ fn find_string_end(text: &str, from: usize) -> Option<usize> {
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-
-    /// Scan to `key` and read its value as a `u64`.
-    fn u64_of(body: &str, key: &str) -> Option<u64> {
-        let mut scanner = TopLevelKeyScanner::new(body);
-        while let Some(found) = scanner.next_top_level_key() {
-            if found == key {
-                return scanner.u64_value();
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn u64_value_reads_a_top_level_integer() {
-        assert_eq!(u64_of(r#"{"max_tokens": 1000}"#, "max_tokens"), Some(1000));
-    }
-
-    #[test]
-    fn u64_value_tolerates_whitespace_and_trailing_fields() {
-        assert_eq!(
-            u64_of(r#"{"model":"gpt-4", "max_tokens" :  42 ,"stream":true}"#, "max_tokens"),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn u64_value_rejects_non_integer_values() {
-        assert_eq!(u64_of(r#"{"max_tokens": null}"#, "max_tokens"), None);
-        assert_eq!(u64_of(r#"{"max_tokens": 1.5}"#, "max_tokens"), None);
-        assert_eq!(u64_of(r#"{"max_tokens": 1e3}"#, "max_tokens"), None);
-        assert_eq!(u64_of(r#"{"max_tokens": "100"}"#, "max_tokens"), None);
-    }
-
-    #[test]
-    fn u64_value_ignores_nested_decoy() {
-        // A nested max_tokens must not be surfaced as a top-level key.
-        assert_eq!(
-            u64_of(r#"{"metadata":{"max_tokens":5},"max_tokens":9}"#, "max_tokens"),
-            Some(9)
-        );
-    }
 
     #[test]
     fn extracts_model_from_compact_json() {
