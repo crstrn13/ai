@@ -35,6 +35,10 @@ filter_chains:
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one more resolve_pipelines argument pushed this over the threshold"
+    )]
     fn resolving_pipelines_registers_policy_connector_before_filter_construction() {
         let config = Config::from_yaml(CONFIG).expect("the test config must parse");
         let client = client(&config);
@@ -60,6 +64,7 @@ filter_chains:
             &registry,
             &Arc::new(HashMap::new()),
             &praxis_core::kv::KvStoreRegistry::new(),
+            &praxis_ai_filters::InFlightRegistry::new(),
             &client,
         );
 
