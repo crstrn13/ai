@@ -16,7 +16,7 @@
 //! rather than committing a truncated value.
 
 /// Longest top-level key considered as a candidate field name. Longer than
-/// any recognized field (`max_completion_tokens` is the longest, at 22
+/// any recognized field (`max_completion_tokens` is the longest, at 21
 /// bytes), so a legitimate key is never truncated before comparison.
 const KEY_CAP: usize = 64;
 

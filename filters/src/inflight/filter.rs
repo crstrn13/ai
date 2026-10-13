@@ -117,12 +117,9 @@ impl HttpFilter for InFlightTrackerFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        // Stream, never StreamBuffer: a passive tracker must not cap request
-        // size. A bounded StreamBuffer rejects bodies over its limit with 413,
-        // and an unbounded one buffers every request in full. `FieldScan`
-        // resolves the top-level `model` and token cap incrementally from
-        // each chunk, wherever in the body they appear, without buffering or
-        // rejecting anything.
+        // Not StreamBuffer: it rejects bodies over its limit with 413, and a
+        // passive tracker must never cap request size. FieldScan reads the
+        // fields incrementally, so plain Stream suffices.
         BodyMode::Stream
     }
 
@@ -171,29 +168,6 @@ fn scan_chunk(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::{super::registry::ModelMetrics, *};
-
-    #[test]
-    fn start_increments_then_complete_decrements() {
-        let registry = InFlightRegistry::new();
-        let reserved = registry.on_request_start("gpt-4", 100);
-        assert_eq!(
-            registry.get("gpt-4"),
-            ModelMetrics {
-                in_flight: 1,
-                reserved_tokens: 100
-            }
-        );
-        registry.on_request_complete("gpt-4", reserved);
-        assert_eq!(registry.get("gpt-4"), ModelMetrics::default());
-    }
-
-    #[test]
-    fn complete_floors_at_zero() {
-        let registry = InFlightRegistry::new();
-        // A stray completion with no matching start must not underflow.
-        registry.on_request_complete("gpt-4", 100);
-        assert_eq!(registry.get("gpt-4"), ModelMetrics::default());
-    }
 
     #[test]
     fn guard_drop_decrements_on_every_path() {

@@ -67,25 +67,30 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
 
 /// Install the pipeline extensions the registered AI filters rely on.
 ///
-/// `inflight_registry` is installed as a pipeline extension so the
-/// `inflight_tracker` filter finds its shared per-model counter table, when
-/// the `inflight-tracker-filter` feature is enabled. Unlike
-/// [`ResponseStoreRegistry`], which is created fresh per pipeline build, the
-/// caller is expected to pass the *same* `InFlightRegistry` handle across
-/// every (re)build of a server's pipelines: in-flight counts are a live gauge
-/// of requests the old pipeline is still serving, and a registry recreated on
-/// every hot reload would reset to zero while those requests are still
-/// in-flight. The registry itself always exists so this plumbing stays in
-/// place independent of the feature gate; callers with nothing to track yet
-/// can just pass a throwaway `InFlightRegistry::new()`.
+/// With the `inflight-tracker-filter` feature, `inflight_registry` is installed
+/// as a pipeline extension so the `inflight_tracker` filter finds its shared
+/// per-model counter table; it is gated on the same feature that registers the
+/// filter, so a stable build carries neither the filter nor its registry
+/// extension. Unlike the response store registry, which is created fresh per
+/// pipeline build, the caller is expected to pass the *same* `InFlightRegistry`
+/// handle across every (re)build of a server's pipelines: in-flight counts are
+/// a live gauge of requests the old pipeline is still serving, and a registry
+/// recreated on every hot reload would reset to zero while those requests are
+/// still in-flight.
 ///
 /// With the `store` feature this also adds a response store registry, which
 /// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
 /// share backends; that one is gated on the same `store` feature that
 /// registers those filters, so a pipeline can never carry them without their
 /// registry.
-///
-/// [`ResponseStoreRegistry`]: praxis_ai_apis::store::ResponseStoreRegistry
+#[cfg_attr(
+    not(any(feature = "inflight-tracker-filter", feature = "store")),
+    expect(
+        unused_variables,
+        clippy::needless_pass_by_ref_mut,
+        reason = "a lean build installs no extensions; the signature stays uniform across feature sets"
+    )
+)]
 pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline, inflight_registry: &InFlightRegistry) {
     #[cfg(feature = "inflight-tracker-filter")]
     pipeline.add_pipeline_extension(Box::new(inflight_registry.clone()));
@@ -93,8 +98,6 @@ pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline,
     let _ = inflight_registry;
     #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    #[cfg(not(feature = "store"))]
-    let _ = &pipeline;
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.

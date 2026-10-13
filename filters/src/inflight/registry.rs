@@ -130,3 +130,31 @@ impl praxis_filter::PipelineExtension for InFlightRegistry {
         extensions.insert(self.clone());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_increments_then_complete_decrements() {
+        let registry = InFlightRegistry::new();
+        let reserved = registry.on_request_start("gpt-4", 100);
+        assert_eq!(
+            registry.get("gpt-4"),
+            ModelMetrics {
+                in_flight: 1,
+                reserved_tokens: 100
+            }
+        );
+        registry.on_request_complete("gpt-4", reserved);
+        assert_eq!(registry.get("gpt-4"), ModelMetrics::default());
+    }
+
+    #[test]
+    fn complete_floors_at_zero() {
+        let registry = InFlightRegistry::new();
+        // A stray completion with no matching start must not underflow.
+        registry.on_request_complete("gpt-4", 100);
+        assert_eq!(registry.get("gpt-4"), ModelMetrics::default());
+    }
+}
