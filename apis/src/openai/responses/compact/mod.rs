@@ -58,6 +58,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
     error::responses_error_rejection,
+    history::MessageHistory,
     is_explicit_compact_request,
     state::{ResponsesState, mark_local_compaction_item},
 };
@@ -214,16 +215,36 @@ impl CompactFilter {
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let result = self.execute_summarization_callout(request, timeout).await;
         Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
+    }
+
+    /// Dial the operator-configured inference endpoint for a summarization.
+    ///
+    /// The destination is `inference_url` from the filter config, so it resolves
+    /// through the shared DNS cache ([`UrlResolutionPolicy::OperatorCached`]).
+    /// The result is mapped back to [`SubRequestError`] so both callout callers
+    /// share [`handle_subrequest_result`](Self::handle_subrequest_result).
+    ///
+    /// [`UrlResolutionPolicy::OperatorCached`]: subrequest::UrlResolutionPolicy::OperatorCached
+    /// [`SubRequestError`]: subrequest::SubRequestError
+    async fn execute_summarization_callout(
+        &self,
+        request: SubRequest,
+        timeout: Duration,
+    ) -> Result<subrequest::SubResponse, subrequest::SubRequestError> {
+        self.client
+            .execute_url(
+                &self.config.inference_url,
+                request,
+                subrequest::address_policy_hook(self.config.address_policy),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                timeout,
+                MAX_SUMMARIZATION_RESPONSE_BYTES,
+                None,
+            )
+            .await
+            .map_err(subrequest::map_url_error)
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -258,15 +279,7 @@ impl CompactFilter {
         let conversation_text = build_conversation_text(messages);
         let request = build_summarization_request(&conversation_text, req.instructions.as_deref(), &req.model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let result = self.execute_summarization_callout(request, timeout).await;
         self.handle_subrequest_result(result)
     }
 
@@ -326,6 +339,10 @@ impl CompactFilter {
     }
 
     /// Inner logic for explicit compact, using `FilterAction` as the error type.
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the summarization callout embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+    )]
     async fn do_explicit_compact(
         &self,
         ctx: &HttpFilterContext<'_>,
@@ -541,7 +558,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------
@@ -1302,21 +1319,24 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 /// client payload, so compaction must not rebuild from `state.input`.
 fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
-    let message_tail = split_current_turn(&mut state.messages, input_len);
-    let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let mut message_tail = split_current_turn(&mut state.messages, input_len);
+    let mut persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    // The replay view carries the unmarked compaction item while the persisted
+    // copy is marked, so the two views genuinely differ and cannot share one
+    // payload. Rehydration strips the marker from the replay projection.
     let persisted_compaction_item = mark_local_compaction_item(compaction_item);
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
-    state.messages.extend(message_tail);
+    state.messages.append(&mut message_tail);
 
     state.persisted_messages.clear();
     state.persisted_messages.push(persisted_compaction_item);
-    state.persisted_messages.extend(persisted_tail);
+    state.persisted_messages.append(&mut persisted_tail);
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.
-fn split_current_turn(items: &mut Vec<Value>, input_len: usize) -> Vec<Value> {
+fn split_current_turn(items: &mut MessageHistory, input_len: usize) -> MessageHistory {
     let start = items.len().saturating_sub(input_len);
     items.split_off(start)
 }
@@ -1346,8 +1366,9 @@ fn build_context_overhead_text(request_body: &Value) -> String {
 ///
 /// Each message becomes `<label>: <text>`, separated by blank lines.
 /// Handles regular messages, tool calls, tool outputs, and prior compaction items.
-fn build_conversation_text(messages: &[Value]) -> String {
-    let mut buf = String::with_capacity(messages.len() * 100);
+fn build_conversation_text<'a>(messages: impl IntoIterator<Item = &'a Value> + 'a) -> String {
+    let messages = messages.into_iter();
+    let mut buf = String::with_capacity(messages.size_hint().0 * 100);
     for msg in messages {
         append_item(&mut buf, msg);
     }
