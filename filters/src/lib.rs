@@ -21,7 +21,6 @@ pub mod guardrails;
 mod identity_guard;
 pub mod inference;
 pub mod inflight;
-mod json_scan;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;

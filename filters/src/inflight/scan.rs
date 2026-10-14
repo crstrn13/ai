@@ -4,9 +4,8 @@
 //! Incremental, resumable scan for a JSON request body's top-level `model`
 //! and token-cap fields.
 //!
-//! Unlike [`crate::json_scan::TopLevelKeyScanner`], which scans one complete
-//! fragment already in hand, [`FieldScan`] is fed body chunks one at a time
-//! and carries only small, bounded state across calls: JSON nesting depth,
+//! [`FieldScan`] is fed body chunks one at a time and carries only small,
+//! bounded state across calls: JSON nesting depth,
 //! string/escape state, which field (if any) is currently being read, and at
 //! most a few hundred bytes for whatever key or value is incomplete. It never
 //! buffers the request body itself, so a `model` or token cap that arrives
