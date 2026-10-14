@@ -12,7 +12,7 @@
 # so to observe the counters, run with trace logging for this filter:
 #
 #   RUST_LOG=info,praxis_ai_filters::inflight=trace \
-#     cargo run -p praxis-ai-proxy -- -c examples/configs/inflight-tracking.yaml
+#     cargo run -p praxis-ai-proxy --features inflight-tracker-filter -- -c examples/configs/inflight-tracking.yaml
 #
 #   curl -X POST http://localhost:8080/v1/chat/completions \
 #     -H "Content-Type: application/json" \
