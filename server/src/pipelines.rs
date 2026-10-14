@@ -151,7 +151,8 @@ pub(crate) fn resolve_pipelines_with_stores(
 /// Returns an error when pipeline construction fails.
 #[expect(
     clippy::too_many_arguments,
-    reason = "threads config, registries, shared services, and a per-listener hook"
+    clippy::too_many_lines,
+    reason = "threads config, registries, shared services, and a per-listener hook over each listener"
 )]
 fn build_listener_pipelines(
     config: &Config,
