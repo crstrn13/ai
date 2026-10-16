@@ -57,6 +57,7 @@ for how these are authored and regenerated.
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
+| [model-to-provider.yaml](configs/model-to-provider.yaml) | Map a stable public model ID to an existing upstream cluster and target model |
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
 | [project-state-owner-headers.yaml](configs/project-state-owner-headers.yaml) | Demonstrates the production boundary used when an external authenticator injects separate tenant and subject headers. `state_owner` consumes those assertions into an immutable internal owner and strips the inbound copies. `project_state_owner_headers` then recreates destination-specific headers from that normalized context |
@@ -68,7 +69,9 @@ for how these are authored and regenerated.
 | [token-counting.yaml](configs/token-counting.yaml) | Extracts token usage from AI inference responses (streaming and non-streaming) and makes counts available to downstream filters via filter metadata as token.input, token.output, and token.total |
 | [token-rate-limit-header-keys.yaml](configs/token-rate-limit-header-keys.yaml) | Extends token-rate-limit.yaml with M5 header dimensions (ai#123 / ai#129): each distinct `x-tenant-id` value gets its own token budget under the same catch-all rule |
 | [token-rate-limit-hierarchy.yaml](configs/token-rate-limit-hierarchy.yaml) | Optional org, then team, then user budgets on one token_rate_limit admission (ai#125) |
+| [token-rate-limit-ip-keys.yaml](configs/token-rate-limit-ip-keys.yaml) | Honor X-Forwarded-For for the IP budget only when a trusted proxy sanitizes it and direct access is blocked; otherwise omit `header` to key on the TCP peer |
 | [token-rate-limit-mixed-algorithms.yaml](configs/token-rate-limit-mixed-algorithms.yaml) | Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 / praxis#551): each rule in `rules:` independently picks sliding_window or token_bucket, matched by a static header value. team-alpha gets an exact trailing-window budget; team-beta gets a continuously-refilling bucket |
+| [token-rate-limit-model-keys.yaml](configs/token-rate-limit-model-keys.yaml) | Extends token-rate-limit.yaml with M5 model dimensions (ai#123): each distinct model identity gets its own token budget under the same catch-all rule |
 | [token-rate-limit-soft-enforcement.yaml](configs/token-rate-limit-soft-enforcement.yaml) | Per-rule `enforcement` chooses what happens when the algorithm denies a reservation because the token budget is exhausted |
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
@@ -172,3 +175,4 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
+| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Translates Anthropic Messages requests into Vertex AI rawPredict form and Vertex responses back to the Anthropic dialect after model_to_provider selects an upstream and resolves its exact target model |
