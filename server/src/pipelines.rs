@@ -505,6 +505,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -519,6 +520,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
